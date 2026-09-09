@@ -1,0 +1,1351 @@
+import numpy as np
+import time
+import pandas as pd
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import MinMaxScaler, RobustScaler
+import json
+import requests
+import datetime
+from datetime import timedelta
+import threading
+import sys
+from flask import Flask, request, jsonify
+from pyts.image import GramianAngularField
+import upstox_client
+from tensorflow.nn import softmax
+import tensorflow as tf
+import nest_asyncio
+import traceback
+from flask_cors import CORS, cross_origin
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
+
+# Feature lists - Only OHLCV + OI for both models
+LSTM_FEATURES = [
+    'Open', 'High', 'Low', 'Close', 'Volume', 'OI'
+]
+
+CNN_FEATURES = LSTM_FEATURES.copy()  # Same features for CNN
+
+nest_asyncio.apply()
+
+# Global variables
+current_position = None
+last_price = 0
+app = Flask(__name__)
+cors = CORS(app)
+app.config['CORS_HEADERS'] = 'Content-Type'
+
+lstm_mae = 6.2598
+cnn_accuracy = 0.82
+g_current_status = "Initializing..."
+predicted_next_close = 0
+
+UPSTOX_API_KEY = "5d4f0968-84a2-4db3-8622-0287bef615e8"
+UPSTOX_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzMjc3NTkiLCJqdGkiOiI2YWEwZTZiYzI3YWQzMzFmYzY4MzkzN2MiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzg4OTI5NzI0LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3ODg5OTEyMDB9._MQ3z05A49ci0d5S8HrA8eoqoYYTg9sHOo0q4TinPSg"
+
+# MCX Instrument Tokens (Gold, Silver, Crude, etc.)
+# Format: MCX_FO|{symbol_code}
+INSTRUMENT_TOKEN_CE = "MCX_FO|576696"  # Gold Options
+INSTRUMENT_TOKEN_PE = "MCX_FO|576850"  # Gold Options
+
+ce_price = 0
+pe_price = 0
+ce_data = []
+pe_data = []
+
+trade_log_global = []
+recent_trades = []
+current_status = 'Starting...'
+lookback = 10
+target_position = 1  # Target the 1st price (next candle)
+last_signal = 0
+last_prediction_time = None
+
+lstm_model = None
+cnn_model = None
+lstm_scaler = None
+target_scaler = None
+cnn_scaler = None
+
+last_processed_minute = None
+live_data = []
+
+model_predictions = {
+    'lstm': {'signal': 0, 'confidence': 0.0, 'prediction': 0.0},
+    'cnn': {'signal': 0, 'confidence': 0.0, 'class_prob': 0.0}
+}
+
+class PaperTradingBot:
+    def __init__(self, balance=100000, lot_size=10):
+        self.balance = balance
+        self.initial_balance = balance
+        self.position = None
+        self.entry_price = None
+        self.stop_loss = None
+        self.target = None
+        self.shares = 0
+        self.lot_size = lot_size  # MCX lot size (10)
+        self.investment_per_trade = None
+        self.last_order_time = None
+        self.order_retry_delay = 30
+        self.min_confidence_move = 0.0008
+        self.max_hold_time = 45
+        self.current_instrument = None
+        self.use_full_capital = True
+        
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_fees_paid = 0
+        self.largest_win = 0
+        self.largest_loss = 0
+        self.consecutive_losses = 0
+        self.max_consecutive_losses = 3
+        
+        self.brokerage_fixed = 5
+        self.gst_rate = 0.18
+        self.stt_sell = 0.0001
+        self.exchange_txn = 0.0000173
+        self.stamp_duty = 0.00002
+        self.sebi_charges = 0.000001
+        
+        self.current_trade_value = 0
+        self.entry_fees_paid = 0
+        
+        # SL = 4%, Target = 1%
+        self.sl_pct = 0.04  # 4% Stop Loss
+        self.target_pct = 0.01  # 1% Target
+        self.risk_reward_ratio = 4  # 1:4 Risk-Reward (Risk 4% to make 1%)
+
+    def calculate_max_shares(self, entry_price, position_type='long'):
+        if entry_price <= 0:
+            return self.lot_size
+        
+        # FULL CAPITAL UTILIZATION - Use 95% of balance
+        available_capital = self.balance * 0.95
+        
+        # Calculate max shares based on available capital
+        max_shares_from_capital = int(available_capital / entry_price)
+        
+        # Round down to nearest lot size (10)
+        shares = (max_shares_from_capital // self.lot_size) * self.lot_size
+        
+        # Ensure at least 1 lot
+        if shares < self.lot_size:
+            shares = self.lot_size
+        
+        # Check if this exceeds balance
+        required_capital = shares * entry_price
+        if required_capital > self.balance * 0.95:
+            shares = ((int((self.balance * 0.95) / entry_price)) // self.lot_size) * self.lot_size
+            if shares < self.lot_size:
+                shares = self.lot_size
+        
+        self.investment_per_trade = shares * entry_price
+        
+        # Calculate risk amount
+        risk_per_share = entry_price * self.sl_pct
+        total_risk = shares * risk_per_share
+        risk_percent = (total_risk / self.balance) * 100
+        
+        print(f"💰 Position: {shares} shares ({shares//self.lot_size} lots) @ {entry_price:.2f} | "
+              f"Investment: {self.investment_per_trade:,.2f} ({self.investment_per_trade/self.balance*100:.1f}% of capital) | "
+              f"Risk: {total_risk:,.2f} ({risk_percent:.2f}% of capital) | "
+              f"SL: {self.sl_pct*100:.1f}% | Target: {self.target_pct*100:.1f}% | "
+              f"Risk-Reward: 1:{self.risk_reward_ratio}")
+        
+        return shares
+
+    def can_place_order(self):
+        if self.last_order_time is None:
+            return True
+        elapsed = (datetime.datetime.now() - self.last_order_time).total_seconds()
+        return elapsed >= self.order_retry_delay
+
+    def calculate_fees(self, trade_value, side='entry'):
+        brokerage = self.brokerage_fixed
+        exchange = trade_value * self.exchange_txn
+        sebi = trade_value * self.sebi_charges
+        gst_base = brokerage + exchange + sebi
+        gst = gst_base * self.gst_rate
+        
+        if side == 'entry':
+            stamp = trade_value * self.stamp_duty
+            stt = 0
+        else:
+            stamp = 0
+            stt = trade_value * self.stt_sell
+            
+        total_fees = brokerage + exchange + sebi + gst + stamp + stt
+        return total_fees
+
+    def execute_paper_trade(self, final_signal, ce_price, pe_price, ensemble_confidence, model_signals):
+        global trade_log_global, recent_trades, current_position
+        
+        # Check consecutive losses
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            status_msg = f"⚠️ STOPPED: Max consecutive losses ({self.consecutive_losses})"
+            print(status_msg)
+            g_current_status = status_msg
+            return
+        
+        if not self.can_place_order():
+            print("⏳ Waiting for cooldown period...")
+            return
+            
+        trade_log = ""
+        
+        try:
+            print(f"\n🔍 Signal Check: final_signal={final_signal}, position={self.position}, "
+                  f"ce_price={ce_price}, pe_price={pe_price}, conf={ensemble_confidence:.3f}")
+            
+            # SIGNAL 1 = BUY CE (Call Option)
+            if final_signal == 1 and self.position is None and ce_price > 0:
+                print(f"✅ BUY CE signal received! Confidence: {ensemble_confidence:.3f}")
+                
+                if ensemble_confidence < 0.25:
+                    print(f"⚠️ Confidence too low: {ensemble_confidence:.3f} < 0.25")
+                    return
+                
+                entry_price = ce_price
+                self.shares = self.calculate_max_shares(entry_price, 'long')
+                
+                # SL = 4%, Target = 1%
+                target_price = entry_price * (1 + self.target_pct)
+                stop_loss_price = entry_price * (1 - self.sl_pct)
+                
+                trade_value = entry_price * self.shares
+                entry_fees = self.calculate_fees(trade_value, side='entry')
+                
+                total_cost = trade_value + entry_fees
+                if total_cost > self.balance:
+                    print(f"⚠️ Insufficient balance: {self.balance:.2f} < {total_cost:.2f}")
+                    return
+                
+                # ENTER POSITION
+                self.last_order_time = datetime.datetime.now()
+                self.position = "long"
+                self.entry_price = entry_price
+                self.stop_loss = stop_loss_price
+                self.target = target_price
+                self.current_instrument = INSTRUMENT_TOKEN_CE
+                current_position = "long"
+                self.current_trade_value = trade_value
+                self.entry_fees_paid = entry_fees
+                
+                self.balance -= (trade_value + entry_fees)
+                self.total_fees_paid += entry_fees
+                self.total_trades += 1
+                
+                expected_profit = (target_price - entry_price) * self.shares
+                expected_loss = (entry_price - stop_loss_price) * self.shares
+                
+                trade_log = (f"📈 BUY CE @ {entry_price:.2f} | "
+                           f"Lots: {self.shares//self.lot_size} | "
+                           f"Investment: {trade_value:,.2f} ({trade_value/self.initial_balance*100:.1f}%) | "
+                           f"Target: {target_price:.2f} (+{self.target_pct*100:.1f}%, +{expected_profit:,.2f}) | "
+                           f"SL: {stop_loss_price:.2f} (-{self.sl_pct*100:.1f}%, -{expected_loss:,.2f}) | "
+                           f"R:R: 1:{self.risk_reward_ratio} | "
+                           f"Conf: {ensemble_confidence:.3f} | "
+                           f"Balance: {self.balance:,.2f}")
+                print(f"✅ POSITION ENTERED: {trade_log}")
+
+            # SIGNAL 2 = BUY PE (Put Option)
+            elif final_signal == 2 and self.position is None and pe_price > 0:
+                print(f"✅ BUY PE signal received! Confidence: {ensemble_confidence:.3f}")
+                
+                if ensemble_confidence < 0.25:
+                    print(f"⚠️ Confidence too low: {ensemble_confidence:.3f} < 0.25")
+                    return
+                
+                entry_price = pe_price
+                self.shares = self.calculate_max_shares(entry_price, 'put')
+                
+                # SL = 4%, Target = 1%
+                target_price = entry_price * (1 + self.target_pct)
+                stop_loss_price = entry_price * (1 - self.sl_pct)
+                
+                trade_value = entry_price * self.shares
+                entry_fees = self.calculate_fees(trade_value, side='entry')
+                
+                total_cost = trade_value + entry_fees
+                if total_cost > self.balance:
+                    print(f"⚠️ Insufficient balance: {self.balance:.2f} < {total_cost:.2f}")
+                    return
+                
+                # ENTER POSITION
+                self.last_order_time = datetime.datetime.now()
+                self.position = "put"
+                self.entry_price = entry_price
+                self.stop_loss = stop_loss_price
+                self.target = target_price
+                self.current_instrument = INSTRUMENT_TOKEN_PE
+                current_position = "put"
+                self.current_trade_value = trade_value
+                self.entry_fees_paid = entry_fees
+                
+                self.balance -= (trade_value + entry_fees)
+                self.total_fees_paid += entry_fees
+                self.total_trades += 1
+                
+                expected_profit = (target_price - entry_price) * self.shares
+                expected_loss = (entry_price - stop_loss_price) * self.shares
+                
+                trade_log = (f"📉 BUY PE @ {entry_price:.2f} | "
+                           f"Lots: {self.shares//self.lot_size} | "
+                           f"Investment: {trade_value:,.2f} ({trade_value/self.initial_balance*100:.1f}%) | "
+                           f"Target: {target_price:.2f} (+{self.target_pct*100:.1f}%, +{expected_profit:,.2f}) | "
+                           f"SL: {stop_loss_price:.2f} (-{self.sl_pct*100:.1f}%, -{expected_loss:,.2f}) | "
+                           f"R:R: 1:{self.risk_reward_ratio} | "
+                           f"Conf: {ensemble_confidence:.3f} | "
+                           f"Balance: {self.balance:,.2f}")
+                print(f"✅ POSITION ENTERED: {trade_log}")
+            
+            # EXIT LOGIC
+            elif self.position:
+                current_price = ce_price if self.current_instrument == INSTRUMENT_TOKEN_CE else pe_price
+                
+                if current_price <= 0:
+                    return
+                
+                should_exit = False
+                exit_reason = ""
+                
+                # Target hit at 1%
+                if current_price >= self.target:
+                    should_exit = True
+                    exit_reason = f"TARGET HIT (+{self.target_pct*100:.1f}%)"
+                # Stop loss hit at 4%
+                elif current_price <= self.stop_loss:
+                    should_exit = True
+                    exit_reason = f"STOP LOSS HIT (-{self.sl_pct*100:.1f}%)"
+                
+                hold_time = (datetime.datetime.now() - self.last_order_time).total_seconds() / 60
+                if not should_exit and hold_time > self.max_hold_time:
+                    should_exit = True
+                    exit_reason = f"TIME LIMIT ({hold_time:.1f} min)"
+                
+                if should_exit:
+                    exit_price = current_price
+                    exit_trade_value = exit_price * self.shares
+                    exit_fees = self.calculate_fees(exit_trade_value, side='exit')
+                    
+                    gross_pnl = (exit_price - self.entry_price) * self.shares
+                    net_pnl = gross_pnl - self.entry_fees_paid - exit_fees
+                    price_change_pct = ((exit_price - self.entry_price) / self.entry_price) * 100
+                    
+                    # Update balance
+                    exit_value = exit_price * self.shares
+                    self.balance += exit_value
+                    self.balance -= exit_fees
+                    
+                    self.total_fees_paid += exit_fees
+                    
+                    if net_pnl > 0:
+                        self.winning_trades += 1
+                        self.consecutive_losses = 0
+                        if net_pnl > self.largest_win:
+                            self.largest_win = net_pnl
+                    else:
+                        self.losing_trades += 1
+                        self.consecutive_losses += 1
+                        if net_pnl < self.largest_loss:
+                            self.largest_loss = net_pnl
+                    
+                    instrument_traded = "CE" if self.current_instrument == INSTRUMENT_TOKEN_CE else "PE"
+                    
+                    entry_price_saved = self.entry_price
+                    shares_saved = self.shares
+                    lots_saved = shares_saved // self.lot_size
+                    
+                    self.position = None
+                    self.current_instrument = None
+                    current_position = None
+                    
+                    win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+                    
+                    trade_log = (f"🚀 EXIT {instrument_traded} ({exit_reason}): "
+                               f"{entry_price_saved:.2f} → {exit_price:.2f} ({price_change_pct:+.2f}%) | "
+                               f"Lots: {lots_saved} | "
+                               f"Gross P&L: {gross_pnl:+,.2f} | "
+                               f"Net P&L: {net_pnl:+,.2f} | "
+                               f"Return: {net_pnl/self.initial_balance*100:+.2f}% | "
+                               f"Win Rate: {win_rate:.1f}% | "
+                               f"Balance: {self.balance:,.2f}")
+                    print(f"✅ POSITION EXITED: {trade_log}")
+                    
+                    recent_trades.append({
+                        'time': datetime.datetime.now(),
+                        'entry_price': entry_price_saved,
+                        'exit_price': exit_price,
+                        'type': instrument_traded,
+                        'reason': exit_reason,
+                        'gross_pnl': gross_pnl,
+                        'net_pnl': net_pnl,
+                        'shares': shares_saved,
+                        'lots': lots_saved,
+                        'entry_fees': self.entry_fees_paid,
+                        'exit_fees': exit_fees
+                    })
+
+            if trade_log:
+                print(f"\n{trade_log}")
+                trade_log_global.append({
+                    'timestamp': datetime.datetime.now().isoformat(),
+                    'message': trade_log
+                })
+                
+                with open("paper_trade_logs.txt", "a") as log_file:
+                    log_file.write(f"{datetime.datetime.now().isoformat()} - {trade_log}\n")
+
+        except Exception as e:
+            print(f"Error in execute_paper_trade: {e}")
+            traceback.print_exc()
+
+    def get_performance_stats(self):
+        total_return = self.balance - self.initial_balance
+        return_pct = (total_return / self.initial_balance) * 100 if self.initial_balance > 0 else 0
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+        
+        total_profit = 0
+        total_loss = 0
+        for trade in recent_trades[-100:]:
+            if trade.get('net_pnl', 0) > 0:
+                total_profit += trade.get('net_pnl', 0)
+            else:
+                total_loss += abs(trade.get('net_pnl', 0))
+        
+        profit_factor = total_profit / total_loss if total_loss > 0 else 0
+        
+        return {
+            'initial_balance': float(self.initial_balance),
+            'current_balance': float(self.balance),
+            'total_return': float(total_return),
+            'return_percentage': float(return_pct),
+            'total_trades': int(self.total_trades),
+            'winning_trades': int(self.winning_trades),
+            'losing_trades': int(self.losing_trades),
+            'win_rate': float(win_rate),
+            'total_fees_paid': float(self.total_fees_paid),
+            'largest_win': float(self.largest_win),
+            'largest_loss': float(self.largest_loss),
+            'profit_factor': float(profit_factor),
+            'consecutive_losses': int(self.consecutive_losses),
+            'lot_size': int(self.lot_size),
+            'current_position': self.position,
+            'entry_price': float(self.entry_price) if self.entry_price else 0,
+            'shares': int(self.shares),
+            'investment_per_trade': float(self.investment_per_trade) if self.investment_per_trade else 0,
+            'sl_percentage': self.sl_pct * 100,
+            'target_percentage': self.target_pct * 100,
+            'risk_reward_ratio': self.risk_reward_ratio
+        }
+
+def get_upstox_config():
+    configuration = upstox_client.Configuration()
+    configuration.access_token = UPSTOX_ACCESS_TOKEN
+    return configuration
+
+def load_all_models():
+    global lstm_model, cnn_model, lstm_scaler, target_scaler, cnn_scaler
+    
+    models_loaded = {'lstm': False, 'cnn': False}
+    
+    # Load LSTM model from lstm_new.h5
+    try:
+        lstm_model = load_model("lstm_new.h5", compile=False)
+        models_loaded['lstm'] = True
+        print("✅ LSTM model loaded successfully from lstm_new.h5")
+    except Exception as e:
+        print(f"❌ Error loading LSTM model from lstm_new.h5: {e}")
+        try:
+            lstm_model = load_model("lstm_model_upstox_optimized.h5", compile=False)
+            models_loaded['lstm'] = True
+            print("✅ LSTM model loaded successfully from lstm_model_upstox_optimized.h5 (fallback)")
+        except Exception as e2:
+            print(f"❌ Error loading LSTM model from fallback: {e2}")
+            lstm_model = None
+
+    # Load CNN model from cnn_new.h5
+    try:
+        cnn_model = load_model("cnn_new.h5", compile=False)
+        models_loaded['cnn'] = True
+        print("✅ CNN model loaded successfully from cnn_new.h5")
+    except Exception as e:
+        print(f"❌ Error loading CNN model from cnn_new.h5: {e}")
+        try:
+            cnn_model = load_model("cnn_model_upstox_optimized.h5", compile=False)
+            models_loaded['cnn'] = True
+            print("✅ CNN model loaded successfully from cnn_model_upstox_optimized.h5 (fallback)")
+        except Exception as e2:
+            print(f"❌ Error loading CNN model from fallback: {e2}")
+            cnn_model = None
+
+    # Load scalers
+    try:
+        # Try to load saved scalers from lstm_new training
+        try:
+            lstm_scaler = joblib.load("scaler_X.pkl")
+            target_scaler = joblib.load("scaler_y.pkl")
+            print("✅ Scalers loaded from saved files (scaler_X.pkl, scaler_y.pkl)")
+        except:
+            lstm_scaler = RobustScaler()
+            target_scaler = MinMaxScaler()
+            print("✅ Using new scalers (fallback)")
+        
+        # Try to load CNN scaler
+        try:
+            cnn_scaler = joblib.load("cnn_feature_scaler.pkl")
+            print("✅ CNN scaler loaded from cnn_feature_scaler.pkl")
+        except:
+            cnn_scaler = MinMaxScaler(feature_range=(-1, 1))
+            print("✅ Using new CNN scaler (fallback)")
+            
+    except Exception as e:
+        print(f"❌ Error initializing scalers: {e}")
+        lstm_scaler = RobustScaler()
+        target_scaler = MinMaxScaler()
+        cnn_scaler = MinMaxScaler(feature_range=(-1, 1))
+
+    return models_loaded
+
+def fetch_and_preprocess_data():
+    access_token = UPSTOX_ACCESS_TOKEN
+    instrument_key = INSTRUMENT_TOKEN_CE
+    interval = "1minute"
+    
+    to_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    from_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
+    
+    url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+   
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {access_token}'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = pd.DataFrame(response.json()['data']['candles'], 
+                              columns=['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume', 'Extra'])
+            
+            data['Datetime'] = pd.to_datetime(data['Datetime'])
+            data[['Open', 'High', 'Low', 'Close', 'Volume']] = data[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+            
+            # Add OI (Open Interest) - Use Extra column as OI if available
+            if 'Extra' in data.columns:
+                data['OI'] = data['Extra'].astype(float)
+            else:
+                # If no OI data, create a placeholder
+                data['OI'] = data['Volume'].rolling(10).mean()
+                data['OI'].fillna(data['Volume'], inplace=True)
+            
+            # Only keep OHLCV + OI (no indicators)
+            data = data[['Open', 'High', 'Low', 'Close', 'Volume', 'OI']]
+            
+            # Handle missing values
+            data.ffill(inplace=True)
+            data.bfill(inplace=True)
+            data.fillna(0, inplace=True)
+            
+            return data
+        else:
+            print(f"Failed to fetch data: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return None
+
+def predict_lstm(price_data, current_price):
+    global model_predictions, lstm_scaler, target_scaler
+    
+    try:
+        if lstm_model is None or len(price_data) < lookback:
+            model_predictions['lstm'] = {'signal': 0, 'confidence': 0.0, 'prediction': current_price}
+            return
+
+        # Create dataframe with OHLCV + OI data
+        df = pd.DataFrame({
+            'Open': price_data[-lookback:],
+            'High': price_data[-lookback:],
+            'Low': price_data[-lookback:],
+            'Close': price_data[-lookback:],
+            'Volume': [1000] * lookback,
+            'OI': [5000] * lookback
+        })
+        
+        # Extract features (OHLCV + OI only)
+        feature_data = df[LSTM_FEATURES].values
+        
+        # Scale features - use saved scaler if available
+        try:
+            lstm_scaled = lstm_scaler.transform(feature_data)
+        except:
+            lstm_scaler.fit(feature_data)
+            lstm_scaled = lstm_scaler.transform(feature_data)
+        
+        lstm_X = lstm_scaled.reshape(1, lookback, len(LSTM_FEATURES))
+        
+        # Make prediction
+        predicted_scaled = lstm_model.predict(lstm_X, verbose=0)[0][0]
+        
+        # Inverse transform the prediction
+        try:
+            close_prices = df['Close'].values.reshape(-1, 1)
+            target_scaler.fit(close_prices)
+            predicted_price = target_scaler.inverse_transform([[predicted_scaled]])[0][0]
+        except:
+            predicted_price = predicted_scaled * 100 + current_price
+            
+        # Calculate signal based on prediction vs current price
+        price_diff = predicted_price - current_price
+        confidence = min(0.95, max(0.2, abs(price_diff / current_price) * 8))
+        
+        # NO THRESHOLD - Signal based solely on direction
+        if price_diff > 0:
+            signal = 1  # BUY CE (Bullish)
+        elif price_diff < 0:
+            signal = 2  # BUY PE (Bearish)
+        else:
+            signal = 0  # HOLD
+            
+        model_predictions['lstm'] = {
+            'signal': signal,
+            'confidence': confidence,
+            'prediction': predicted_price
+        }
+        
+        print(f"📊 LSTM: Signal={signal}, Conf={confidence:.3f}, Pred={predicted_price:.2f}, Diff={price_diff:.2f}")
+        
+    except Exception as e:
+        print(f"❌ LSTM prediction error: {e}")
+        traceback.print_exc()
+        model_predictions['lstm'] = {'signal': 0, 'confidence': 0.0, 'prediction': current_price}
+
+def predict_cnn(price_data, current_price):
+    global model_predictions, cnn_scaler
+    
+    try:
+        if cnn_model is None or len(price_data) < lookback:
+            model_predictions['cnn'] = {'signal': 0, 'confidence': 0.0, 'class_prob': 0.5}
+            return
+
+        # Create dataframe with OHLCV + OI data
+        df = pd.DataFrame({
+            'Open': price_data[-lookback:],
+            'High': price_data[-lookback:],
+            'Low': price_data[-lookback:],
+            'Close': price_data[-lookback:],
+            'Volume': [1000] * lookback,
+            'OI': [5000] * lookback
+        })
+        
+        # Extract features (OHLCV + OI only)
+        feature_data = df[CNN_FEATURES].values
+        
+        # Scale features for CNN
+        try:
+            cnn_values = cnn_scaler.transform(feature_data)
+        except:
+            cnn_scaler.fit(feature_data)
+            cnn_values = cnn_scaler.transform(feature_data)
+        
+        # Create GAF images
+        gaf = GramianAngularField(method="summation", image_size=lookback)
+        gaf_images = gaf.fit_transform(cnn_values.T)
+        cnn_X = gaf_images.transpose(1, 2, 0)[np.newaxis, ...]
+        
+        # Make prediction
+        cnn_pred = cnn_model.predict(cnn_X, verbose=0)
+        predicted_class = np.argmax(cnn_pred, axis=1)[0]
+        class_probabilities = softmax(cnn_pred).numpy()[0]
+        class_prob = class_probabilities[predicted_class]
+        
+        # Map class to signal
+        # Class 0 = Hold, Class 1 = Buy (Bullish), Class 2 = Sell (Bearish)
+        if predicted_class == 1 and class_prob > 0.35:
+            signal = 1  # BUY CE
+        elif predicted_class == 2 and class_prob > 0.35:
+            signal = 2  # BUY PE
+        else:
+            signal = 0  # HOLD
+            
+        model_predictions['cnn'] = {
+            'signal': signal,
+            'confidence': class_prob,
+            'class_prob': class_prob,
+            'predicted_class': predicted_class
+        }
+        
+        print(f"📊 CNN: Class={predicted_class}, Signal={signal}, Conf={class_prob:.3f}")
+        
+    except Exception as e:
+        print(f"❌ CNN prediction error: {e}")
+        traceback.print_exc()
+        model_predictions['cnn'] = {'signal': 0, 'confidence': 0.0, 'class_prob': 0.5}
+
+def ensemble_signal_generation(current_price):
+    try:
+        lstm_signal = model_predictions['lstm']['signal']
+        lstm_conf = model_predictions['lstm']['confidence']
+        
+        cnn_signal = model_predictions['cnn']['signal']
+        cnn_conf = model_predictions['cnn']['confidence']
+        
+        print(f"📊 Raw Signals - LSTM: {lstm_signal} (conf: {lstm_conf:.3f}), CNN: {cnn_signal} (conf: {cnn_conf:.3f})")
+        
+        # RULE: LSTM and CNN must agree on the same signal
+        if lstm_signal != 0 and cnn_signal == lstm_signal:
+            # Both models agree
+            final_signal = lstm_signal
+            consensus_type = "BOTH_AGREE"
+            ensemble_confidence = (lstm_conf + cnn_conf) / 2
+            print(f"✅ BOTH MODELS AGREE: Signal {final_signal}")
+        else:
+            # No agreement
+            final_signal = 0
+            consensus_type = "NO_CONSENSUS"
+            ensemble_confidence = 0.0
+            if lstm_signal == 0:
+                print(f"⏸️ LSTM NEUTRAL: No direction")
+            elif cnn_signal == 0:
+                print(f"⏸️ CNN NEUTRAL: No direction")
+            else:
+                print(f"⏸️ DISAGREEMENT: LSTM={lstm_signal}, CNN={cnn_signal}")
+        
+        # Apply confidence threshold
+        if final_signal != 0 and ensemble_confidence < 0.25:
+            print(f"⚠️ Confidence too low: {ensemble_confidence:.3f} < 0.25")
+            final_signal = 0
+        
+        model_signals = {
+            'lstm': lstm_signal,
+            'cnn': cnn_signal,
+            'consensus': consensus_type,
+            'lstm_conf': lstm_conf,
+            'cnn_conf': cnn_conf,
+            'ensemble_confidence': ensemble_confidence
+        }
+        
+        print(f"🎯 FINAL SIGNAL: {final_signal} (1=BUY CE, 2=BUY PE, 0=HOLD) | {consensus_type}")
+        
+        return final_signal, ensemble_confidence, model_signals
+        
+    except Exception as e:
+        print(f"❌ Ensemble signal generation error: {e}")
+        return 0, 0.30, {'lstm': 0, 'cnn': 0, 'consensus': 'ERROR'}
+
+def update_status_ensemble(ce_price, pe_price, final_signal, ensemble_confidence, model_signals):
+    global current_status, g_current_status, last_prediction_time, paper_trading_bot
+    
+    last_prediction_time = datetime.datetime.now()
+    stats = paper_trading_bot.get_performance_stats()
+    
+    lstm_signal = model_signals.get('lstm', 0)
+    cnn_signal = model_signals.get('cnn', 0)
+    consensus_status = model_signals.get('consensus', 'UNKNOWN')
+    lstm_conf = model_signals.get('lstm_conf', 0)
+    cnn_conf = model_signals.get('cnn_conf', 0)
+    
+    if consensus_status == 'BOTH_AGREE':
+        consensus_indicator = "✅BOTH_AGREE"
+    else:
+        consensus_indicator = "❌NO_AGREEMENT"
+    
+    signal_text = "HOLD"
+    if final_signal == 1:
+        signal_text = "BUY_CE"
+    elif final_signal == 2:
+        signal_text = "BUY_PE"
+    
+    current_status = (
+        f"CE: {ce_price:.2f} | PE: {pe_price:.2f} | "
+        f"Balance: {paper_trading_bot.balance:,.2f} ({stats['return_percentage']:+.1f}%) | "
+        f"Position: {paper_trading_bot.position or 'None'} | "
+        f"Trades: {stats['total_trades']} | "
+        f"WinRate: {stats['win_rate']:.1f}% | "
+        f"Signal: {signal_text} ({ensemble_confidence:.3f}) | "
+        f"{consensus_indicator} | "
+        f"LSTM:{lstm_signal}({lstm_conf:.2f}) CNN:{cnn_signal}({cnn_conf:.2f}) | "
+        f"SL:4% | Target:1% | "
+        f"Time: {datetime.datetime.now().strftime('%H:%M:%S')}"
+    )
+    
+    g_current_status = current_status
+    return current_status
+
+def predict_with_ensemble(price_data, ce_price, pe_price):
+    try:
+        global current_status, predicted_next_close, last_price, g_current_status, last_signal
+        
+        if len(price_data) < lookback:
+            error_msg = f"Error: Not enough data points (have {len(price_data)}, need {lookback})"
+            print(error_msg)
+            g_current_status = error_msg
+            return
+
+        current_price = price_data[-1]
+        last_price = current_price
+
+        predict_lstm(price_data, current_price)
+        predict_cnn(price_data, current_price)
+        
+        final_signal, ensemble_confidence, model_signals = ensemble_signal_generation(current_price)
+        
+        predicted_next_close = model_predictions['lstm']['prediction']
+        last_signal = final_signal
+
+        paper_trading_bot.execute_paper_trade(final_signal, ce_price, pe_price, ensemble_confidence, model_signals)
+
+        update_status_ensemble(ce_price, pe_price, final_signal, ensemble_confidence, model_signals)
+        
+    except Exception as e:
+        error_msg = f"Critical error in predict_with_ensemble(): {str(e)}"
+        print(f"\n{error_msg}")
+        g_current_status = error_msg
+        traceback.print_exc()
+
+def start_websocket():
+    """Start WebSocket connection for real-time price data from Upstox"""
+    global live_data, g_current_status, ce_price, pe_price, ce_data, pe_data
+    tick_count = 0
+    ce_tick_count = 0
+    pe_tick_count = 0
+
+    def on_error(error):
+        print(f"WebSocket error: {error}")
+        g_current_status = f"WebSocket error: {error}"
+
+    def on_message(message):
+        global live_data, last_price, g_current_status, ce_price, pe_price, ce_data, pe_data
+        nonlocal tick_count, ce_tick_count, pe_tick_count
+
+        try:
+            # Handle different message types
+            if isinstance(message, str):
+                data = json.loads(message)
+            elif isinstance(message, dict):
+                data = message
+            else:
+                return
+            
+            # Debug: print first few messages
+            if tick_count < 3:
+                print(f"📨 Raw message {tick_count}: {json.dumps(data, indent=2)[:500]}...")
+            
+            # Check for subscription confirmation
+            if 'type' in data:
+                if data['type'] == 'sub':
+                    print(f"✅ Subscription confirmed: {data.get('s', 'ok')}")
+                    return
+                elif data['type'] == 'market_info':
+                    return
+                elif data['type'] == 'error':
+                    print(f"❌ WebSocket error: {data.get('message', 'Unknown error')}")
+                    g_current_status = f"WebSocket error: {data.get('message', 'Unknown error')}"
+                    return
+            
+            # Process market data
+            if 'feeds' in data:
+                feeds = data['feeds']
+                
+                # Process CE data - try multiple possible structures
+                ce_ltp = None
+                if INSTRUMENT_TOKEN_CE in feeds:
+                    ce_feed = feeds[INSTRUMENT_TOKEN_CE]
+                    
+                    # Try different structures
+                    if 'ltp' in ce_feed:
+                        ce_ltp = float(ce_feed['ltp'])
+                    elif 'fullFeed' in ce_feed and 'marketFF' in ce_feed['fullFeed']:
+                        market_ff = ce_feed['fullFeed']['marketFF']
+                        if 'ltpc' in market_ff and 'ltp' in market_ff['ltpc']:
+                            ce_ltp = float(market_ff['ltpc']['ltp'])
+                    elif 'fullFeed' in ce_feed and 'ltpc' in ce_feed['fullFeed']:
+                        if 'ltp' in ce_feed['fullFeed']['ltpc']:
+                            ce_ltp = float(ce_feed['fullFeed']['ltpc']['ltp'])
+                    elif 'price' in ce_feed:
+                        ce_ltp = float(ce_feed['price'])
+                    elif 'last_price' in ce_feed:
+                        ce_ltp = float(ce_feed['last_price'])
+                
+                if ce_ltp is not None and ce_ltp > 0:
+                    ce_price = ce_ltp
+                    ce_tick_count += 1
+                    
+                    if len(ce_data) >= lookback:
+                        ce_data.pop(0)
+                    ce_data.append(ce_price)
+                    
+                    if tick_count < 5:
+                        print(f"✅ CE Price: {ce_price:.2f}")
+                
+                # Process PE data
+                pe_ltp = None
+                if INSTRUMENT_TOKEN_PE in feeds:
+                    pe_feed = feeds[INSTRUMENT_TOKEN_PE]
+                    
+                    if 'ltp' in pe_feed:
+                        pe_ltp = float(pe_feed['ltp'])
+                    elif 'fullFeed' in pe_feed and 'marketFF' in pe_feed['fullFeed']:
+                        market_ff = pe_feed['fullFeed']['marketFF']
+                        if 'ltpc' in market_ff and 'ltp' in market_ff['ltpc']:
+                            pe_ltp = float(market_ff['ltpc']['ltp'])
+                    elif 'fullFeed' in pe_feed and 'ltpc' in pe_feed['fullFeed']:
+                        if 'ltp' in pe_feed['fullFeed']['ltpc']:
+                            pe_ltp = float(pe_feed['fullFeed']['ltpc']['ltp'])
+                    elif 'price' in pe_feed:
+                        pe_ltp = float(pe_feed['price'])
+                    elif 'last_price' in pe_feed:
+                        pe_ltp = float(pe_feed['last_price'])
+                
+                if pe_ltp is not None and pe_ltp > 0:
+                    pe_price = pe_ltp
+                    pe_tick_count += 1
+                    
+                    if len(pe_data) >= lookback:
+                        pe_data.pop(0)
+                    pe_data.append(pe_price)
+                    
+                    if tick_count < 5:
+                        print(f"✅ PE Price: {pe_price:.2f}")
+            
+            tick_count += 1
+            
+            # Update live data with CE price (primary instrument)
+            if ce_price > 0:
+                last_price = ce_price
+                if len(live_data) >= lookback:
+                    live_data.pop(0)
+                live_data.append(ce_price)
+            elif pe_price > 0:
+                last_price = pe_price
+                if len(live_data) >= lookback:
+                    live_data.pop(0)
+                live_data.append(pe_price)
+            
+            # Update status
+            stats = paper_trading_bot.get_performance_stats()
+            g_current_status = (
+                f"CE: {ce_price:.2f} | PE: {pe_price:.2f} | "
+                f"Balance: {paper_trading_bot.balance:,.2f} ({stats['return_percentage']:+.1f}%) | "
+                f"Position: {paper_trading_bot.position or 'None'} | "
+                f"Trades: {stats['total_trades']} | "
+                f"WinRate: {stats['win_rate']:.1f}% | "
+                f"SL:4% | Target:1% | "
+                f"Time: {datetime.datetime.now().strftime('%H:%M:%S')}"
+            )
+            
+            # Run prediction if we have enough data
+            if len(live_data) >= lookback and ce_price > 0 and pe_price > 0:
+                predict_with_ensemble(live_data, ce_price, pe_price)
+            else:
+                g_current_status += f" | Data: {len(live_data)}/{lookback}"
+            
+            if tick_count % 30 == 0:
+                sys.stdout.write(f"\r{g_current_status}")
+                sys.stdout.flush()
+                
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON decode error: {e}")
+        except Exception as e:
+            error_msg = f"Error in message processing: {str(e)}"
+            print(f"\n{error_msg}")
+            g_current_status = error_msg
+            traceback.print_exc()
+
+    try:
+        configuration = get_upstox_config()
+        
+        # Create WebSocket connection
+        print("🔌 Creating Upstox WebSocket connection...")
+        
+        streamer = upstox_client.MarketDataStreamerV3(
+            upstox_client.ApiClient(configuration),
+            [INSTRUMENT_TOKEN_CE, INSTRUMENT_TOKEN_PE],
+            "full"
+        )
+        
+        streamer.on("message", on_message)
+        streamer.on("error", on_error)
+        
+        print(f"📡 Connecting to Upstox WebSocket for MCX instruments...")
+        print(f"📊 CE Instrument: {INSTRUMENT_TOKEN_CE}")
+        print(f"📊 PE Instrument: {INSTRUMENT_TOKEN_PE}")
+        g_current_status = "Connecting to Upstox WebSocket..."
+        
+        streamer.connect()
+        print("✅ WebSocket connected successfully!")
+        
+    except Exception as e:
+        error_msg = f"Failed to establish WebSocket connection: {e}"
+        print(f"❌ {error_msg}")
+        g_current_status = error_msg
+        traceback.print_exc()
+
+# Flask API Routes
+@app.route('/update', methods=['POST'])
+@cross_origin()
+def update():
+    global lstm_mae, cnn_accuracy, g_current_status, lstm_model, cnn_model
+    try:
+        data = request.get_json()
+        
+        # Handle model reload
+        if 'Updated' in data:
+            models_loaded = load_all_models()
+            g_current_status = f"Models updated: {data['Updated']}"
+            return jsonify({'message': 'Models reloaded successfully', 'models_loaded': models_loaded}), 200
+        
+        # Handle LSTM MAE update
+        if 'LSTM' in data:
+            lstm_mae = float(data['LSTM'])
+            print(f"📊 LSTM MAE updated to: {lstm_mae:.4f}")
+            g_current_status = f"LSTM MAE updated to: {lstm_mae:.4f}"
+            return jsonify({'message': 'LSTM MAE updated', 'lstm_mae': lstm_mae}), 200
+        
+        # Handle CNN Accuracy update
+        if 'CNN' in data:
+            cnn_accuracy = float(data['CNN'])
+            print(f"📊 CNN Accuracy updated to: {cnn_accuracy:.4f}")
+            g_current_status = f"CNN Accuracy updated to: {cnn_accuracy:.4f}"
+            return jsonify({'message': 'CNN Accuracy updated', 'cnn_accuracy': cnn_accuracy}), 200
+        
+        # Handle both LSTM and CNN together
+        if 'LSTM_MAE' in data and 'CNN_ACC' in data:
+            lstm_mae = float(data['LSTM_MAE'])
+            cnn_accuracy = float(data['CNN_ACC'])
+            print(f"📊 LSTM MAE: {lstm_mae:.4f}, CNN Accuracy: {cnn_accuracy:.4f}")
+            g_current_status = f"Updated: LSTM_MAE={lstm_mae:.4f}, CNN_ACC={cnn_accuracy:.4f}"
+            return jsonify({
+                'message': 'Both metrics updated',
+                'lstm_mae': lstm_mae,
+                'cnn_accuracy': cnn_accuracy
+            }), 200
+        
+        return jsonify({'error': 'Missing parameter. Use LSTM, CNN, or Updated'}), 400
+        
+    except Exception as e:
+        error_msg = f"Error in update endpoint: {str(e)}"
+        print(error_msg)
+        g_current_status = error_msg
+        return jsonify({'error': error_msg}), 500
+
+@app.route('/update_metrics', methods=['POST'])
+@cross_origin()
+def update_metrics():
+    global lstm_mae, cnn_accuracy, g_current_status
+    try:
+        data = request.get_json()
+        
+        updates = []
+        
+        if 'lstm_mae' in data:
+            lstm_mae = float(data['lstm_mae'])
+            updates.append(f"LSTM_MAE={lstm_mae:.4f}")
+            
+        if 'cnn_accuracy' in data:
+            cnn_accuracy = float(data['cnn_accuracy'])
+            updates.append(f"CNN_ACC={cnn_accuracy:.4f}")
+            
+        if not updates:
+            return jsonify({'error': 'No metrics provided'}), 400
+            
+        g_current_status = f"Updated: {', '.join(updates)}"
+        print(f"📊 {g_current_status}")
+        
+        return jsonify({
+            'message': 'Metrics updated',
+            'lstm_mae': lstm_mae,
+            'cnn_accuracy': cnn_accuracy,
+            'current_status': g_current_status
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/trade_logs', methods=['GET'])
+@cross_origin()
+def serve_trade_logs():
+    try:
+        recent_logs = trade_log_global[-50:] if trade_log_global else []
+        stats = paper_trading_bot.get_performance_stats()
+        
+        response_data = {
+            'current_status': g_current_status,
+            'global_logs': recent_logs,
+            'recent_trades': recent_trades[-20:],
+            'performance_stats': stats,
+            'balance': float(paper_trading_bot.balance),
+            'last_price': float(last_price) if last_price is not None else 0,
+            'ce_price': float(ce_price) if ce_price else 0,
+            'pe_price': float(pe_price) if pe_price else 0,
+            'current_position': paper_trading_bot.position,
+            'entry_price': float(paper_trading_bot.entry_price) if paper_trading_bot.entry_price else 0,
+            'shares': paper_trading_bot.shares,
+            'target': float(paper_trading_bot.target) if paper_trading_bot.target else 0,
+            'stop_loss': float(paper_trading_bot.stop_loss) if paper_trading_bot.stop_loss else 0,
+            'last_signal': int(last_signal),
+            'predicted_next_close': float(predicted_next_close) if predicted_next_close else 0,
+            'server_time': datetime.datetime.now().isoformat(),
+            'trading_mode': 'PAPER_ONLY',
+            'model_type': 'ENSEMBLE (LSTM+CNN)',
+            'voting_system': 'BOTH_MODELS_AGREE',
+            'lot_size': paper_trading_bot.lot_size,
+            'target_percentage': paper_trading_bot.target_pct * 100,
+            'stop_loss_percentage': paper_trading_bot.sl_pct * 100,
+            'risk_reward_ratio': f'1:{paper_trading_bot.risk_reward_ratio}',
+            'consecutive_losses': paper_trading_bot.consecutive_losses,
+            'max_consecutive_losses': paper_trading_bot.max_consecutive_losses,
+            'lookback': lookback,
+            'target_position': target_position,
+            'features_used': LSTM_FEATURES,
+            'lstm_model_file': 'lstm_new.h5',
+            'cnn_model_file': 'cnn_new.h5',
+            'capital_utilization': 'FULL (95%)',
+            'lstm_mae': lstm_mae,
+            'cnn_accuracy': cnn_accuracy
+        }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        error_msg = f"Error in trade_logs endpoint: {str(e)}"
+        print(error_msg)
+        traceback.print_exc()
+        return jsonify({'error': error_msg}), 500
+
+@app.route('/status', methods=['GET'])
+@cross_origin()
+def get_status():
+    try:
+        stats = paper_trading_bot.get_performance_stats()
+        return jsonify({
+            'status': g_current_status,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'ce_price': float(ce_price) if ce_price else 0,
+            'pe_price': float(pe_price) if pe_price else 0,
+            'balance': float(paper_trading_bot.balance),
+            'performance_stats': stats,
+            'trading_mode': 'PAPER_ONLY',
+            'current_position': paper_trading_bot.position,
+            'lot_size': paper_trading_bot.lot_size,
+            'target_percentage': paper_trading_bot.target_pct * 100,
+            'stop_loss_percentage': paper_trading_bot.sl_pct * 100,
+            'risk_reward_ratio': f'1:{paper_trading_bot.risk_reward_ratio}',
+            'consecutive_losses': paper_trading_bot.consecutive_losses,
+            'max_consecutive_losses': paper_trading_bot.max_consecutive_losses,
+            'lookback': lookback,
+            'target_position': target_position,
+            'features_used': LSTM_FEATURES,
+            'lstm_model_file': 'lstm_new.h5',
+            'cnn_model_file': 'cnn_new.h5',
+            'capital_utilization': 'FULL (95%)',
+            'lstm_mae': lstm_mae,
+            'cnn_accuracy': cnn_accuracy
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/performance', methods=['GET'])
+@cross_origin()
+def get_performance():
+    try:
+        stats = paper_trading_bot.get_performance_stats()
+        return jsonify({
+            'performance': stats,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'trading_mode': 'PAPER_ONLY',
+            'lot_size': paper_trading_bot.lot_size,
+            'target_percentage': paper_trading_bot.target_pct * 100,
+            'stop_loss_percentage': paper_trading_bot.sl_pct * 100,
+            'risk_reward_ratio': f'1:{paper_trading_bot.risk_reward_ratio}',
+            'lookback': lookback,
+            'target_position': target_position,
+            'features_used': LSTM_FEATURES,
+            'lstm_model_file': 'lstm_new.h5',
+            'cnn_model_file': 'cnn_new.h5',
+            'capital_utilization': 'FULL (95%)',
+            'lstm_mae': lstm_mae,
+            'cnn_accuracy': cnn_accuracy
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+@cross_origin()
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.datetime.now().isoformat(),
+        'trading_mode': 'PAPER_ONLY',
+        'websocket_connected': len(live_data) > 0,
+        'lot_size': paper_trading_bot.lot_size,
+        'models_loaded': {
+            'lstm': lstm_model is not None,
+            'cnn': cnn_model is not None
+        },
+        'consecutive_losses': paper_trading_bot.consecutive_losses,
+        'max_consecutive_losses': paper_trading_bot.max_consecutive_losses,
+        'lookback': lookback,
+        'target_position': target_position,
+        'features_used': LSTM_FEATURES,
+        'lstm_model_file': 'lstm_new.h5',
+        'cnn_model_file': 'cnn_new.h5',
+        'capital_utilization': 'FULL (95%)',
+        'lstm_mae': lstm_mae,
+        'cnn_accuracy': cnn_accuracy
+    }), 200
+
+@app.route('/reset', methods=['POST'])
+@cross_origin()
+def reset_bot():
+    global paper_trading_bot, trade_log_global, recent_trades, current_position
+    
+    try:
+        paper_trading_bot = PaperTradingBot(balance=100000, lot_size=10)
+        trade_log_global = []
+        recent_trades = []
+        current_position = None
+        
+        return jsonify({
+            'message': 'Bot reset successfully',
+            'lot_size': paper_trading_bot.lot_size,
+            'initial_balance': 100000,
+            'target_percentage': paper_trading_bot.target_pct * 100,
+            'stop_loss_percentage': paper_trading_bot.sl_pct * 100,
+            'risk_reward_ratio': f'1:{paper_trading_bot.risk_reward_ratio}',
+            'lookback': lookback,
+            'target_position': target_position,
+            'features_used': LSTM_FEATURES,
+            'lstm_model_file': 'lstm_new.h5',
+            'cnn_model_file': 'cnn_new.h5',
+            'capital_utilization': 'FULL (95%)'
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Initialize paper trading bot with lot size 10
+paper_trading_bot = PaperTradingBot(balance=100000, lot_size=10)
+
+# Main execution
+if __name__ == '__main__':
+    import os
+    
+    print("="*80)
+    print("ENSEMBLE PAPER TRADING BOT - LSTM+CNN (SL=4%, Target=1%)")
+    print("="*80)
+    
+    print("🎯 Trading Mode: PAPER TRADING ONLY - NO REAL ORDERS")
+    print("🤖 ML Models: LSTM + CNN Ensemble")
+    print(f"📊 LSTM Model File: lstm_new.h5")
+    print(f"📊 CNN Model File: cnn_new.h5")
+    print("📊 Features Used: OHLCV + OI (Only)")
+    print(f"📊 Lookback Period: {lookback} candles")
+    print(f"📊 Target Position: Next Candle (1 step ahead)")
+    print("📊 LSTM: Signal based on direction (price_diff > 0 or < 0)")
+    print("📊 Signal Mapping:")
+    print("   1 = BUY CE (Call Option - Bullish)")
+    print("   2 = BUY PE (Put Option - Bearish)")
+    print("   0 = HOLD")
+    print("📊 Voting System: BOTH MODELS MUST AGREE")
+    print("   - LSTM provides direction signal based on price prediction")
+    print("   - CNN provides classification signal")
+    print("   - Both must agree on the same signal for a trade")
+    print(f"📊 Lot Size: {paper_trading_bot.lot_size}")
+    print(f"💰 Capital Utilization: FULL (95% of balance)")
+    print(f"📊 Initial Balance: ₹{paper_trading_bot.initial_balance:,.2f}")
+    print(f"🛑 STOP-LOSS: {paper_trading_bot.sl_pct*100:.1f}%")
+    print(f"🎯 TARGET: {paper_trading_bot.target_pct*100:.1f}%")
+    print(f"📊 Risk-Reward: 1:{paper_trading_bot.risk_reward_ratio}")
+    print("🔽 Confidence Threshold: 0.25")
+    print("🔽 CNN Threshold: 0.35")
+    print("🛑 Max Consecutive Losses: 3 (auto-stop)")
+    print("💰 Balance Management: Full capital utilization with lot size 10")
+    
+    print(f"📈 CE Instrument: {INSTRUMENT_TOKEN_CE}")
+    print(f"📉 PE Instrument: {INSTRUMENT_TOKEN_PE}")
+    print(f"💵 Initial Balance: Rs{paper_trading_bot.balance:,.2f}")
+    print(f"📊 Lot Size: {paper_trading_bot.lot_size}")
+    
+    print("\n🤖 Loading ML models...")
+    models_loaded = load_all_models()
+    print(f"✅ Models loaded: {models_loaded}")
+    
+    print("📊 Fetching historical data...")
+    historical_data = fetch_and_preprocess_data()
+    if historical_data is None:
+        print("❌ Error: Failed to fetch historical data. Exiting...")
+        sys.exit(1)
+
+    print(f"✅ Fetched {len(historical_data)} data points")
+
+    live_data = historical_data['Close'].tolist()[-lookback:]
+    print(f"✅ Initialized with {len(live_data)} price points")
+
+    g_current_status = "Paper trading bot initialized - Waiting for WebSocket data..."
+    print(g_current_status)
+
+    print("\n🌐 Starting Flask server on port 5000...")
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False),
+        daemon=True
+    )
+    flask_thread.start()
+    
+    time.sleep(3)
+    print("✅ Flask server started successfully")
+    
+    print("\n📡 API Endpoints:")
+    print("  GET  /status              - Bot status")
+    print("  GET  /trade_logs          - Trading logs and performance")
+    print("  GET  /performance         - Performance metrics")
+    print("  GET  /health              - Health check")
+    print("  POST /reset               - Reset bot")
+    print("  POST /update              - Update models/parameters")
+    print("  POST /update_metrics      - Update LSTM MAE and CNN accuracy")
+    
+    now = datetime.datetime.now()
+    print(f"\n🚀 Connecting to Upstox WebSocket at: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("🔄 Waiting for real price data from Upstox...")
+    
+    g_current_status = f"Connecting to Upstox WebSocket at {now.strftime('%H:%M:%S')}..."
+    
+    try:
+        start_websocket()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Shutting down paper trading bot...")
+        stats = paper_trading_bot.get_performance_stats()
+        
+        print("\n" + "="*60)
+        print("📈 FINAL PERFORMANCE SUMMARY")
+        print("="*60)
+        print(f"💰 Initial Balance:    Rs{stats['initial_balance']:,.2f}")
+        print(f"💰 Final Balance:      Rs{stats['current_balance']:,.2f}")
+        print(f"📊 Total Return:       Rs{stats['total_return']:,.2f} ({stats['return_percentage']:+.2f}%)")
+        print(f"🎯 Total Trades:       {stats['total_trades']}")
+        print(f"✅ Winning Trades:     {stats['winning_trades']}")
+        print(f"❌ Losing Trades:      {stats['losing_trades']}")
+        print(f"📈 Win Rate:           {stats['win_rate']:.1f}%")
+        print(f"📊 Profit Factor:      {stats['profit_factor']:.2f}")
+        print(f"💸 Total Fees Paid:    Rs{stats['total_fees_paid']:.2f}")
+        print(f"🏆 Largest Win:        Rs{stats['largest_win']:.2f}")
+        print(f"💥 Largest Loss:       Rs{stats['largest_loss']:.2f}")
+        print(f"📊 Lot Size:           {stats['lot_size']}")
+        print(f"🛑 Stop-Loss Used:     {stats.get('sl_percentage', 4.0):.1f}%")
+        print(f"🎯 Target Used:        {stats.get('target_percentage', 1.0):.1f}%")
+        print(f"📊 Risk-Reward:        1:{stats.get('risk_reward_ratio', 4)}")
+        print(f"⚠️ Consecutive Losses:  {stats['consecutive_losses']}")
+        print(f"📊 LSTM Model:         lstm_new.h5")
+        print(f"📊 CNN Model:          cnn_new.h5")
+        print(f"📊 Features:           OHLCV + OI")
+        print(f"📊 Target:             Next Candle (1 step ahead)")
+        print(f"📊 Voting System:      BOTH MODELS MUST AGREE")
+        print(f"📊 Capital Utilization: FULL (95%)")
+        print("="*60)
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        traceback.print_exc()
