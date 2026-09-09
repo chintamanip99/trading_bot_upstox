@@ -1,0 +1,621 @@
+import numpy as np
+import pandas as pd
+import requests
+import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from tensorflow.keras.models import Sequential, save_model, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+import matplotlib.pyplot as plt
+import joblib
+import os
+
+# Your existing function
+def fetch_historical_data():
+    """Fetch historical candle data from Upstox API"""
+    access_token = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzMjc3NTkiLCJqdGkiOiI2YWEwZTZiYzI3YWQzMzFmYzY4MzkzN2MiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzg4OTI5NzI0LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3ODg5OTEyMDB9._MQ3z05A49ci0d5S8HrA8eoqoYYTg9sHOo0q4TinPSg"
+    instrument_key = "MCX_FO|576696"
+    interval = "1minute"
+    
+    to_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    from_date = (datetime.datetime.now() - datetime.timedelta(days=20)).strftime('%Y-%m-%d')
+    
+    url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+   
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {access_token}'
+    }
+    
+    response = requests.get(url, headers=headers)
+    
+    if response.status_code == 200:
+        data = response.json().get('data', {}).get('candles', [])
+        if not data:
+            print("No data found in API response")
+            return None
+            
+        df = pd.DataFrame(data, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+        
+        numeric_columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'OI']
+        df[numeric_columns] = df[numeric_columns].astype(float)
+        df.sort_index(inplace=True)
+        
+        return df
+    else:
+        print(f"API request failed with status code: {response.status_code}")
+        return None
+
+def calculate_metrics(y_true, y_pred):
+    """
+    Calculate multiple regression metrics
+    
+    Args:
+        y_true: Actual values
+        y_pred: Predicted values
+        
+    Returns:
+        Dictionary with all metrics
+    """
+    # Handle any potential NaN or infinite values
+    y_true = np.array(y_true).flatten()
+    y_pred = np.array(y_pred).flatten()
+    
+    # Remove any NaN values
+    mask = ~(np.isnan(y_true) | np.isnan(y_pred) | 
+             np.isinf(y_true) | np.isinf(y_pred))
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    
+    if len(y_true) == 0:
+        return {
+            'R2': np.nan,
+            'MSE': np.nan,
+            'RMSE': np.nan,
+            'MAE': np.nan,
+            'MAPE': np.nan
+        }
+    
+    # Calculate metrics
+    r2 = r2_score(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    
+    # MAPE (Mean Absolute Percentage Error)
+    # Avoid division by zero
+    mask_nonzero = y_true != 0
+    if np.sum(mask_nonzero) > 0:
+        mape = np.mean(np.abs((y_true[mask_nonzero] - y_pred[mask_nonzero]) / 
+                              y_true[mask_nonzero])) * 100
+    else:
+        mape = np.nan
+    
+    return {
+        'R2': r2,
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'MAPE': mape
+    }
+
+class LSTMPricePredictor:
+    def __init__(self, lookback=10, target_position=1):
+        """
+        Initialize LSTM predictor
+        
+        Args:
+            lookback (int): Number of time steps to look back
+            target_position (int): Which future price to predict (0-indexed from current)
+        """
+        self.lookback = lookback
+        self.target_position = target_position
+        self.scaler_X = MinMaxScaler()
+        self.scaler_y = MinMaxScaler()
+        self.model = None
+        self.training_metrics = {}
+        self.test_metrics = {}
+        self.model_filename = "lstm_new.h5"
+        self.scaler_X_filename = "scaler_X.pkl"
+        self.scaler_y_filename = "scaler_y.pkl"
+        
+    def prepare_data(self, df):
+        """
+        Prepare data for LSTM with OHLCV features and target_position price as target
+        
+        Args:
+            df (pd.DataFrame): DataFrame with OHLCV columns
+            
+        Returns:
+            X, y: Features and targets for training
+        """
+        # Use all OHLCV columns as features
+        feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'OI']
+        
+        # Scale the features
+        scaled_data = self.scaler_X.fit_transform(df[feature_cols].values)
+        scaled_df = pd.DataFrame(scaled_data, columns=feature_cols, index=df.index)
+        
+        X, y = [], []
+        
+        for i in range(len(scaled_df) - self.lookback - self.target_position):
+            # Features: lookback window of OHLCV data
+            X.append(scaled_df.iloc[i:i+self.lookback].values)
+            
+            # Target: the Close price at target_position steps ahead
+            target_price = df['Close'].iloc[i+self.lookback+self.target_position]
+            y.append(target_price)
+        
+        return np.array(X), np.array(y)
+    
+    def build_model(self, input_shape):
+        """Build LSTM model"""
+        model = Sequential([
+            LSTM(units=50, return_sequences=True, input_shape=input_shape),
+            Dropout(0.2),
+            LSTM(units=50, return_sequences=False),
+            Dropout(0.2),
+            Dense(units=25),
+            Dense(units=1)
+        ])
+        
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
+        return model
+    
+    def train(self, X, y, test_size=0.2, epochs=50, batch_size=32):
+        """
+        Train the LSTM model
+        
+        Args:
+            X, y: Features and targets
+            test_size: Proportion of data for testing
+            epochs: Number of training epochs
+            batch_size: Batch size for training
+        """
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, shuffle=False
+        )
+        
+        # Scale the target values
+        y_train_scaled = self.scaler_y.fit_transform(y_train.reshape(-1, 1))
+        y_test_scaled = self.scaler_y.transform(y_test.reshape(-1, 1))
+        
+        # Build and train model
+        self.model = self.build_model((X.shape[1], X.shape[2]))
+        
+        early_stopping = EarlyStopping(
+            monitor='val_loss', 
+            patience=10, 
+            restore_best_weights=True
+        )
+        
+        history = self.model.fit(
+            X_train, y_train_scaled,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_split=0.2,
+            callbacks=[early_stopping],
+            verbose=1
+        )
+        
+        # Make predictions
+        y_train_pred_scaled = self.model.predict(X_train)
+        y_test_pred_scaled = self.model.predict(X_test)
+        
+        # Inverse transform predictions
+        y_train_pred = self.scaler_y.inverse_transform(y_train_pred_scaled)
+        y_test_pred = self.scaler_y.inverse_transform(y_test_pred_scaled)
+        
+        # Calculate metrics for training set
+        self.training_metrics = calculate_metrics(y_train, y_train_pred)
+        
+        # Calculate metrics for test set
+        self.test_metrics = calculate_metrics(y_test, y_test_pred)
+        
+        # Print metrics
+        self.print_metrics()
+        
+        # Save the model
+        self.save_model()
+        
+        # Update the trading bot with LSTM MAE
+        self.update_trading_bot()
+        
+        return history, y_test, y_test_pred.flatten()
+    
+    def update_trading_bot(self):
+        """Update the trading bot with LSTM MAE metric"""
+        try:
+            # Get MAE from test metrics
+            lstm_mae = self.test_metrics.get('MAE', 0)
+            
+            if lstm_mae > 0:
+                # Send update to trading bot - use 'LSTM' key
+                response = requests.post(
+                    "http://localhost:5000/update", 
+                    json={"LSTM": float(lstm_mae)}
+                )
+                
+                if response.status_code == 200:
+                    print(f"\n✅ Trading bot updated with LSTM MAE: {lstm_mae:.4f}")
+                    print(f"   Response: {response.json()}")
+                else:
+                    print(f"\n⚠️ Failed to update trading bot (status: {response.status_code})")
+                    print(f"   Response: {response.text}")
+            else:
+                print("\n⚠️ No valid MAE value to send")
+                
+        except requests.exceptions.ConnectionError:
+            print("\n⚠️ Trading bot not running or unreachable")
+        except Exception as e:
+            print(f"\n❌ Error updating trading bot: {e}")
+    
+    def save_model(self):
+        """Save the trained model and scalers"""
+        if self.model is None:
+            print("⚠️ No model to save. Train the model first.")
+            return
+        
+        try:
+            # Save model
+            self.model.save(self.model_filename)
+            print(f"✅ Model saved as '{self.model_filename}'")
+            
+            # Save scalers
+            joblib.dump(self.scaler_X, self.scaler_X_filename)
+            joblib.dump(self.scaler_y, self.scaler_y_filename)
+            print(f"✅ Feature scaler saved as '{self.scaler_X_filename}'")
+            print(f"✅ Target scaler saved as '{self.scaler_y_filename}'")
+            
+            # Save configuration
+            config = {
+                'lookback': self.lookback,
+                'target_position': self.target_position,
+                'feature_columns': ['Open', 'High', 'Low', 'Close', 'Volume', 'OI'],
+                'training_metrics': self.training_metrics,
+                'test_metrics': self.test_metrics,
+                'model_filename': self.model_filename,
+                'scaler_X_filename': self.scaler_X_filename,
+                'scaler_y_filename': self.scaler_y_filename,
+                'saved_date': datetime.datetime.now().isoformat()
+            }
+            
+            config_df = pd.DataFrame([config])
+            config_df.to_csv('lstm_model_config.csv', index=False)
+            print(f"✅ Model configuration saved as 'lstm_model_config.csv'")
+            
+            # Create a summary file
+            with open('lstm_model_summary.txt', 'w') as f:
+                f.write("="*60 + "\n")
+                f.write("LSTM MODEL SUMMARY\n")
+                f.write("="*60 + "\n\n")
+                f.write(f"Model filename: {self.model_filename}\n")
+                f.write(f"Lookback: {self.lookback}\n")
+                f.write(f"Target position: {self.target_position}\n")
+                f.write(f"Features: Open, High, Low, Close, Volume, OI\n")
+                f.write(f"Saved date: {datetime.datetime.now().isoformat()}\n\n")
+                
+                f.write("TRAINING METRICS:\n")
+                f.write("-"*40 + "\n")
+                for key, value in self.training_metrics.items():
+                    if key == 'MAPE':
+                        f.write(f"{key}: {value:.2f}%\n")
+                    else:
+                        f.write(f"{key}: {value:.6f}\n")
+                
+                f.write("\nTEST METRICS:\n")
+                f.write("-"*40 + "\n")
+                for key, value in self.test_metrics.items():
+                    if key == 'MAPE':
+                        f.write(f"{key}: {value:.2f}%\n")
+                    else:
+                        f.write(f"{key}: {value:.6f}\n")
+                
+                f.write("\n" + "="*60 + "\n")
+            
+            print(f"✅ Model summary saved as 'lstm_model_summary.txt'")
+            
+        except Exception as e:
+            print(f"❌ Error saving model: {e}")
+    
+    def load_model(self):
+        """Load the saved model and scalers"""
+        try:
+            if os.path.exists(self.model_filename):
+                self.model = load_model(self.model_filename)
+                print(f"✅ Model loaded from '{self.model_filename}'")
+            else:
+                print(f"⚠️ Model file '{self.model_filename}' not found")
+                return False
+            
+            if os.path.exists(self.scaler_X_filename):
+                self.scaler_X = joblib.load(self.scaler_X_filename)
+                print(f"✅ Feature scaler loaded from '{self.scaler_X_filename}'")
+            else:
+                print(f"⚠️ Scaler file '{self.scaler_X_filename}' not found")
+                return False
+            
+            if os.path.exists(self.scaler_y_filename):
+                self.scaler_y = joblib.load(self.scaler_y_filename)
+                print(f"✅ Target scaler loaded from '{self.scaler_y_filename}'")
+            else:
+                print(f"⚠️ Scaler file '{self.scaler_y_filename}' not found")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            return False
+    
+    def print_metrics(self):
+        """Print all calculated metrics"""
+        print("\n" + "="*60)
+        print("MODEL PERFORMANCE METRICS")
+        print("="*60)
+        
+        print("\n📊 TRAINING SET METRICS:")
+        print("-" * 40)
+        for metric_name, value in self.training_metrics.items():
+            if metric_name == 'MAPE':
+                print(f"{metric_name:>8}: {value:>10.2f}%")
+            else:
+                print(f"{metric_name:>8}: {value:>10.4f}")
+        
+        print("\n📊 TEST SET METRICS:")
+        print("-" * 40)
+        for metric_name, value in self.test_metrics.items():
+            if metric_name == 'MAPE':
+                print(f"{metric_name:>8}: {value:>10.2f}%")
+            else:
+                print(f"{metric_name:>8}: {value:>10.4f}")
+        
+        print("="*60)
+        
+        # Interpretation
+        print("\n📈 INTERPRETATION:")
+        print("-" * 40)
+        r2 = self.test_metrics.get('R2', 0)
+        mape = self.test_metrics.get('MAPE', 100)
+        
+        if r2 > 0.8:
+            print(f"✓ R² = {r2:.3f} - Excellent fit (model explains >80% of variance)")
+        elif r2 > 0.6:
+            print(f"✓ R² = {r2:.3f} - Good fit (model explains 60-80% of variance)")
+        elif r2 > 0.4:
+            print(f"✓ R² = {r2:.3f} - Moderate fit (model explains 40-60% of variance)")
+        else:
+            print(f"✗ R² = {r2:.3f} - Weak fit (model explains <40% of variance)")
+        
+        if mape < 2:
+            print(f"✓ MAPE = {mape:.2f}% - Excellent prediction accuracy")
+        elif mape < 5:
+            print(f"✓ MAPE = {mape:.2f}% - Good prediction accuracy")
+        elif mape < 10:
+            print(f"✓ MAPE = {mape:.2f}% - Moderate prediction accuracy")
+        else:
+            print(f"✗ MAPE = {mape:.2f}% - Poor prediction accuracy")
+    
+    def predict_next(self, last_sequence):
+        """
+        Make prediction for next price
+        
+        Args:
+            last_sequence: Last lookback window of OHLCV data
+            
+        Returns:
+            Predicted price
+        """
+        if self.model is None:
+            raise ValueError("Model not trained yet!")
+        
+        # Scale the input sequence
+        scaled_sequence = self.scaler_X.transform(last_sequence)
+        scaled_sequence = scaled_sequence.reshape(1, self.lookback, -1)
+        
+        # Predict
+        prediction_scaled = self.model.predict(scaled_sequence)
+        prediction = self.scaler_y.inverse_transform(prediction_scaled)
+        
+        return prediction[0][0]
+    
+    def visualize_predictions(self, y_test, y_pred, plot_metrics=True):
+        """Visualize actual vs predicted prices with metrics"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Plot 1: Actual vs Predicted
+        ax1 = axes[0, 0]
+        ax1.plot(y_test, label='Actual Prices', color='blue', alpha=0.7)
+        ax1.plot(y_pred, label='Predicted Prices', color='red', alpha=0.7)
+        ax1.set_title(f'LSTM Predictions (lookback={self.lookback}, target={self.target_position})')
+        ax1.set_xlabel('Test Sample Index')
+        ax1.set_ylabel('Price')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Scatter plot with R²
+        ax2 = axes[0, 1]
+        ax2.scatter(y_test, y_pred, alpha=0.5)
+        ax2.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
+        ax2.set_xlabel('Actual Prices')
+        ax2.set_ylabel('Predicted Prices')
+        ax2.set_title(f'Actual vs Predicted (R² = {self.test_metrics["R2"]:.4f})')
+        ax2.grid(True, alpha=0.3)
+        
+        # Plot 3: Residuals
+        ax3 = axes[1, 0]
+        residuals = y_test - y_pred
+        ax3.scatter(range(len(residuals)), residuals, alpha=0.5)
+        ax3.axhline(y=0, color='r', linestyle='--', linewidth=2)
+        ax3.set_xlabel('Test Sample Index')
+        ax3.set_ylabel('Residuals (Actual - Predicted)')
+        ax3.set_title(f'Residual Plot (MAE = {self.test_metrics["MAE"]:.4f})')
+        ax3.grid(True, alpha=0.3)
+        
+        # Plot 4: Error Distribution
+        ax4 = axes[1, 1]
+        ax4.hist(residuals, bins=30, edgecolor='black', alpha=0.7)
+        ax4.axvline(x=0, color='r', linestyle='--', linewidth=2)
+        ax4.set_xlabel('Residuals')
+        ax4.set_ylabel('Frequency')
+        ax4.set_title(f'Error Distribution (RMSE = {self.test_metrics["RMSE"]:.4f})')
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def get_metrics_summary(self):
+        """Return a summary DataFrame of all metrics"""
+        metrics_df = pd.DataFrame({
+            'Metric': ['R²', 'MSE', 'RMSE', 'MAE', 'MAPE'],
+            'Training': [
+                self.training_metrics.get('R2', np.nan),
+                self.training_metrics.get('MSE', np.nan),
+                self.training_metrics.get('RMSE', np.nan),
+                self.training_metrics.get('MAE', np.nan),
+                self.training_metrics.get('MAPE', np.nan)
+            ],
+            'Test': [
+                self.test_metrics.get('R2', np.nan),
+                self.test_metrics.get('MSE', np.nan),
+                self.test_metrics.get('RMSE', np.nan),
+                self.test_metrics.get('MAE', np.nan),
+                self.test_metrics.get('MAPE', np.nan)
+            ]
+        })
+        
+        # Format MAPE with % sign
+        metrics_df.loc[metrics_df['Metric'] == 'MAPE', 'Training'] = \
+            metrics_df.loc[metrics_df['Metric'] == 'MAPE', 'Training'].apply(
+                lambda x: f"{x:.2f}%" if not np.isnan(x) else "NaN"
+            )
+        metrics_df.loc[metrics_df['Metric'] == 'MAPE', 'Test'] = \
+            metrics_df.loc[metrics_df['Metric'] == 'MAPE', 'Test'].apply(
+                lambda x: f"{x:.2f}%" if not np.isnan(x) else "NaN"
+            )
+        
+        return metrics_df
+
+def main():
+    # Fetch data
+    print("="*60)
+    print("LSTM TRAINING WITH OHLCV + OI FEATURES")
+    print("="*60)
+    print("Fetching historical data...")
+    df = fetch_historical_data()
+    
+    if df is None:
+        print("Failed to fetch data")
+        return
+    
+    print(f"Data shape: {df.shape}")
+    print(f"Date range: {df.index[0]} to {df.index[-1]}")
+    print(f"Columns: {df.columns.tolist()}")
+    
+    # Initialize predictor
+    predictor = LSTMPricePredictor(lookback=10, target_position=1)
+    
+    # Prepare data
+    print("\nPreparing data for LSTM...")
+    X, y = predictor.prepare_data(df)
+    print(f"Features shape: {X.shape}")
+    print(f"Targets shape: {y.shape}")
+    
+    # Train model
+    print("\nTraining LSTM model...")
+    history, y_test, y_pred = predictor.train(X, y, test_size=0.2, epochs=50)
+    
+    # Display metrics summary
+    print("\n📋 METRICS SUMMARY:")
+    print(predictor.get_metrics_summary().to_string(index=False))
+    
+    # Visualize results
+    predictor.visualize_predictions(y_test, y_pred)
+    
+    # Plot training history
+    plt.figure(figsize=(12, 4))
+    plt.plot(history.history['loss'], label='Training Loss', linewidth=2)
+    plt.plot(history.history['val_loss'], label='Validation Loss', linewidth=2)
+    plt.title('Model Loss During Training')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+    
+    # Example: Make a prediction for the next price
+    if len(df) >= predictor.lookback:
+        last_sequence = df[['Open', 'High', 'Low', 'Close', 'Volume', 'OI']].iloc[-predictor.lookback:].values
+        next_price = predictor.predict_next(last_sequence)
+        current_price = df['Close'].iloc[-1]
+        
+        print("\n" + "="*60)
+        print("PRICE PREDICTION")
+        print("="*60)
+        print(f"Current price: ₹{current_price:.2f}")
+        print(f"Predicted next price: ₹{next_price:.2f}")
+        print(f"Expected change: ₹{next_price - current_price:.2f} ({((next_price - current_price)/current_price*100):.2f}%)")
+        print("="*60)
+        
+        print("\n" + "="*60)
+        print("MODEL FILES SAVED:")
+        print("="*60)
+        print(f"1. {predictor.model_filename} - LSTM model")
+        print(f"2. {predictor.scaler_X_filename} - Feature scaler")
+        print(f"3. {predictor.scaler_y_filename} - Target scaler")
+        print(f"4. lstm_model_config.csv - Model configuration")
+        print(f"5. lstm_model_summary.txt - Model summary")
+        print("="*60)
+
+def test_loaded_model():
+    """Test loading the saved model"""
+    print("\n" + "="*60)
+    print("TESTING LOADED MODEL")
+    print("="*60)
+    
+    # Create a new predictor instance
+    predictor = LSTMPricePredictor(lookback=10, target_position=1)
+    
+    # Load the saved model
+    if predictor.load_model():
+        print("\n✅ Model loaded successfully!")
+        
+        # Fetch new data for testing
+        print("\nFetching new data for testing...")
+        df = fetch_historical_data()
+        
+        if df is not None and len(df) >= predictor.lookback:
+            last_sequence = df[['Open', 'High', 'Low', 'Close', 'Volume', 'OI']].iloc[-predictor.lookback:].values
+            next_price = predictor.predict_next(last_sequence)
+            current_price = df['Close'].iloc[-1]
+            
+            print("\n" + "="*60)
+            print("PREDICTION USING LOADED MODEL")
+            print("="*60)
+            print(f"Current price: ₹{current_price:.2f}")
+            print(f"Predicted next price: ₹{next_price:.2f}")
+            print(f"Expected change: ₹{next_price - current_price:.2f} ({((next_price - current_price)/current_price*100):.2f}%)")
+            print("="*60)
+    else:
+        print("❌ Failed to load model")
+
+if __name__ == "__main__":
+    # Train and save the model
+    while True:
+        main()
+    print("\n" + "="*60)
+    print("🔄 Training completed.")
+    print("="*60 + "\n")
+    
+    # Optional: Test loading the saved model
+    # Uncomment the line below to test loading
+    # test_loaded_model()
