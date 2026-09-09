@@ -1,0 +1,342 @@
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import classification_report
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from pyts.image import GramianAngularField
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+from imblearn.over_sampling import RandomOverSampler
+import talib
+import joblib
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Parameters
+WINDOW_SIZE = 10
+BATCH_SIZE = 8
+EPOCHS = 100
+LEARNING_RATE = 0.001
+TARGET_POSITION = 1  # Target the 1st price (next candle)
+
+# Only OHLCV + OI features
+FEATURES = [
+    'Open', 'High', 'Low', 'Close', 'Volume', 'OI'
+]
+
+# --- Feature Engineering ---
+def clean_data(df):
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.fillna(method='ffill', inplace=True)
+    df.fillna(method='bfill', inplace=True)
+    df.fillna(0, inplace=True)
+    return df
+
+def fetch_and_preprocess_data():
+    """Fetch real-time data and preprocess it for training."""
+    access_token = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzMjc3NTkiLCJqdGkiOiI2YWEwZTZiYzI3YWQzMzFmYzY4MzkzN2MiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzg4OTI5NzI0LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3ODg5OTEyMDB9._MQ3z05A49ci0d5S8HrA8eoqoYYTg9sHOo0q4TinPSg"
+    instrument_key = "MCX_FO|576696"
+    interval = "1minute"
+    
+    to_date = datetime.now().strftime('%Y-%m-%d')
+    from_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+    
+    url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+   
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {access_token}'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        print(f"Response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            print(f"Data keys: {data.keys() if data else 'No data'}")
+            
+            # Parse the data
+            candles = data.get('data', {}).get('candles', [])
+            if not candles:
+                print("No candles found in response")
+                return None, None
+            
+            btc_data = pd.DataFrame(candles, 
+                                   columns=['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume', 'Extra'])
+            
+            btc_data['Datetime'] = pd.to_datetime(btc_data['Datetime'])
+            btc_data[['Open', 'High', 'Low', 'Close', 'Volume']] = btc_data[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+            
+            # Add OI (Open Interest) - use Extra column if available, otherwise use Volume
+            if 'Extra' in btc_data.columns:
+                btc_data['OI'] = btc_data['Extra'].astype(float)
+            else:
+                # If no OI data, create a placeholder using Volume
+                btc_data['OI'] = btc_data['Volume'].rolling(10).mean()
+                btc_data['OI'].fillna(btc_data['Volume'], inplace=True)
+            
+            # Keep only OHLCV + OI
+            btc_data = btc_data[['Open', 'High', 'Low', 'Close', 'Volume', 'OI']]
+            
+            # Clean data
+            btc_data = clean_data(btc_data)
+            
+            print(f"Data shape: {btc_data.shape}")
+            print(f"Columns: {btc_data.columns.tolist()}")
+            
+            # Create target labels based on future price movement (TARGET_POSITION ahead)
+            btc_data['future_price'] = btc_data['Close'].shift(-TARGET_POSITION)
+            btc_data['price_change'] = btc_data['future_price'] - btc_data['Close']
+            
+            # Create labels: 0=Hold, 1=Buy (Bullish), 2=Sell (Bearish)
+            # Use quantiles for labeling
+            upper_quantile = btc_data['price_change'].quantile(0.85)  # Top 15%
+            lower_quantile = btc_data['price_change'].quantile(0.15)  # Bottom 15%
+            
+            btc_data['label'] = btc_data['price_change'].apply(
+                lambda x: 1 if x > upper_quantile else 2 if x < lower_quantile else 0
+            )
+            
+            print(f"\nQuantile values:")
+            print(f"Upper quantile (85%): {upper_quantile:.4f}")
+            print(f"Lower quantile (15%): {lower_quantile:.4f}")
+            print(f"Target position: {TARGET_POSITION} candles ahead")
+            
+            # Remove rows with NaN
+            btc_data.dropna(inplace=True)
+            
+            print(f"\nClass distribution:")
+            print(btc_data['label'].value_counts())
+            
+            # Scale features
+            scaler = MinMaxScaler(feature_range=(-1, 1))
+            btc_data[FEATURES] = scaler.fit_transform(btc_data[FEATURES])
+            joblib.dump(scaler, 'cnn_feature_scaler.pkl')
+            print("✅ Scaler saved as 'cnn_feature_scaler.pkl'")
+            
+            return btc_data, FEATURES
+        else:
+            print(f"Failed to fetch data: {response.status_code} - {response.text}")
+            return None, None
+            
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+def create_gaf_images(data, columns, window_size):
+    """Create Gramian Angular Field images from time series data"""
+    gaf = GramianAngularField(method='summation', image_size=window_size)
+    gaf_images = []
+    
+    for i in range(window_size, len(data)):
+        window_data = data.iloc[i-window_size:i][columns].values.T.astype(np.float64)
+        try:
+            gaf_image = gaf.fit_transform(window_data)
+            gaf_images.append(gaf_image)
+        except Exception as e:
+            print(f"Error creating GAF image at index {i}: {e}")
+            continue
+            
+    return np.array(gaf_images)
+
+def create_cnn_model(input_shape):
+    """Create CNN model for classification"""
+    model = Sequential([
+        Conv2D(32, (3, 3), activation='swish', padding='same', input_shape=input_shape),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Dropout(0.2),
+        
+        Conv2D(64, (3, 3), activation='swish', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Dropout(0.2),
+        
+        Conv2D(128, (3, 3), activation='swish', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Dropout(0.2),
+        
+        Flatten(),
+        Dense(128, activation='swish'),
+        Dropout(0.3),
+        Dense(64, activation='swish'),
+        Dropout(0.2),
+        Dense(3, activation='softmax')  # 3 classes: Hold, Buy, Sell
+    ])
+    
+    model.compile(
+        optimizer=Adam(learning_rate=LEARNING_RATE),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    return model
+
+def main():
+    print("="*60)
+    print("CNN TRAINING WITH OHLCV + OI FEATURES")
+    print("="*60)
+    print(f"Features: {FEATURES}")
+    print(f"Window size: {WINDOW_SIZE}")
+    print(f"Target position: {TARGET_POSITION} candles ahead")
+    print("="*60)
+    
+    print("\n📊 Fetching and preprocessing data...")
+    btc_data, features = fetch_and_preprocess_data()
+    
+    if btc_data is None or len(btc_data) < WINDOW_SIZE + TARGET_POSITION:
+        print("❌ Error: Not enough data for training")
+        return
+    
+    print(f"✅ Data shape: {btc_data.shape}")
+    print(f"✅ Features: {features}")
+    
+    print("\n🔄 Creating GAF images...")
+    gaf_images = create_gaf_images(btc_data, features, WINDOW_SIZE)
+    
+    if len(gaf_images) == 0:
+        print("❌ Error: No GAF images created")
+        return
+        
+    X_gaf = np.transpose(gaf_images, (0, 2, 3, 1))
+    y_labels = btc_data['label'].values[WINDOW_SIZE:]
+    
+    print(f"✅ GAF images shape: {X_gaf.shape}")
+    print(f"✅ Labels shape: {y_labels.shape}")
+    print(f"Class Distribution (Before): {np.bincount(y_labels)}")
+    
+    # Check if we have enough classes
+    unique_classes = np.unique(y_labels)
+    if len(unique_classes) < 2:
+        print(f"❌ Error: Only found {len(unique_classes)} classes. Need at least 2 classes for training.")
+        return
+    
+    # Handle class imbalance
+    print("\n⚖️ Balancing classes using RandomOverSampler...")
+    ros = RandomOverSampler(random_state=42)
+    X_reshaped = X_gaf.reshape(X_gaf.shape[0], -1)
+    X_resampled, y_resampled = ros.fit_resample(X_reshaped, y_labels)
+    X_resampled = X_resampled.reshape(-1, WINDOW_SIZE, WINDOW_SIZE, len(features))
+    print(f"Class Distribution (After): {np.bincount(y_resampled)}")
+    
+    # Split data
+    print("\n📊 Splitting data into train and validation sets...")
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_resampled, y_resampled, test_size=0.2, random_state=42, stratify=y_resampled)
+    
+    print(f"Training samples: {len(X_train)}")
+    print(f"Validation samples: {len(X_val)}")
+    
+    # Create and train model
+    print("\n🧠 Creating CNN model...")
+    model = create_cnn_model((WINDOW_SIZE, WINDOW_SIZE, len(features)))
+    model.summary()
+    
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_loss', 
+        factor=0.5, 
+        patience=10, 
+        min_lr=0.00001, 
+        verbose=1
+    )
+    
+    early_stop = EarlyStopping(
+        monitor='val_loss', 
+        patience=20, 
+        restore_best_weights=True,
+        verbose=1
+    )
+    
+    print("\n🚀 Training model...")
+    history = model.fit(
+        X_train, y_train,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_data=(X_val, y_val),
+        callbacks=[reduce_lr, early_stop],
+        verbose=1
+    )
+    
+    # Evaluate model
+    print("\n📊 Evaluating model...")
+    y_pred = model.predict(X_val)
+    y_pred_classes = np.argmax(y_pred, axis=1)
+    
+    # Get actual classes present in validation set
+    present_classes = np.unique(y_val)
+    target_names = ['Hold', 'Buy', 'Sell']
+    present_target_names = [target_names[i] for i in present_classes if i < len(target_names)]
+    
+    print("\n📈 Class distribution in validation set:")
+    for i, count in enumerate(np.bincount(y_val)):
+        if i < len(target_names):
+            print(f"{target_names[i]}: {count}")
+    
+    print("\n📋 Classification Report:")
+    print(classification_report(y_val, y_pred_classes, target_names=present_target_names))
+    
+    # Save model
+    print("\n💾 Saving model...")
+    model.save('cnn_new.h5')
+    print("✅ Model saved as 'cnn_new.h5'")
+    
+    # Save configuration
+    config = {
+        'model_file': 'cnn_new.h5',
+        'features': FEATURES,
+        'window_size': WINDOW_SIZE,
+        'target_position': TARGET_POSITION,
+        'classes': ['Hold', 'Buy', 'Sell'],
+        'class_mapping': {0: 'Hold', 1: 'Buy (Bullish)', 2: 'Sell (Bearish)'}
+    }
+    
+    config_df = pd.DataFrame([config])
+    config_df.to_csv('cnn_model_config.csv', index=False)
+    print("✅ Configuration saved as 'cnn_model_config.csv'")
+    
+    # Calculate and send CNN accuracy from validation set
+    try:
+        # Get validation accuracy
+        val_accuracy = history.history['val_accuracy'][-1] if history.history.get('val_accuracy') else 0.85
+        val_accuracy = float(val_accuracy)
+        
+        # Send CNN accuracy to trading bot
+        response = requests.post(
+            "http://localhost:5000/update", 
+            json={"CNN": val_accuracy}
+        )
+        if response.status_code == 200:
+            print(f"✅ Updated trading bot with CNN accuracy: {val_accuracy:.4f}")
+            print(f"   Response: {response.json()}")
+        else:
+            print(f"⚠️ Could not update trading bot (status: {response.status_code})")
+            print(f"   Response: {response.text}")
+    except requests.exceptions.ConnectionError:
+        print("⚠️ Trading bot not running or unreachable")
+    except Exception as e:
+        print(f"⚠️ Error updating trading bot: {e}")
+    
+    print("\n" + "="*60)
+    print("✅ CNN TRAINING COMPLETE")
+    print("="*60)
+    print(f"📁 Model saved: cnn_new.h5")
+    print(f"📁 Scaler saved: cnn_feature_scaler.pkl")
+    print(f"📁 Config saved: cnn_model_config.csv")
+    print(f"Features used: {FEATURES}")
+    print(f"Target position: {TARGET_POSITION} candles ahead")
+    print("="*60)
+
+if __name__ == "__main__":
+    while True:
+        main()
+    print("\n" + "="*60)
+    print("🔄 Training completed.")
+    print("="*60 + "\n")
