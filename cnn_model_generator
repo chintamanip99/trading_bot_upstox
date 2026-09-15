@@ -10,7 +10,6 @@ from tensorflow.keras.optimizers import Adam
 from pyts.image import GramianAngularField
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
 from imblearn.over_sampling import RandomOverSampler
-import talib
 import joblib
 from datetime import datetime, timedelta
 import warnings
@@ -28,6 +27,10 @@ FEATURES = [
     'Open', 'High', 'Low', 'Close', 'Volume', 'OI'
 ]
 
+# IMPORTANT: saved alongside the model so the bot can verify feature count
+FEATURE_COUNT = len(FEATURES)
+
+
 # --- Feature Engineering ---
 def clean_data(df):
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -36,225 +39,224 @@ def clean_data(df):
     df.fillna(0, inplace=True)
     return df
 
+
 def fetch_and_preprocess_data():
     """Fetch real-time data and preprocess it for training."""
     access_token = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzMjc3NTkiLCJqdGkiOiI2YWEwZTZiYzI3YWQzMzFmYzY4MzkzN2MiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzg4OTI5NzI0LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3ODg5OTEyMDB9._MQ3z05A49ci0d5S8HrA8eoqoYYTg9sHOo0q4TinPSg"
-    instrument_key = "MCX_FO|576696"
+    instrument_key = "NSE_FO|56995"
     interval = "1minute"
-    
+
     to_date = datetime.now().strftime('%Y-%m-%d')
     from_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-    
+
     url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
-   
+
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {access_token}'
     }
-    
+
     try:
         response = requests.get(url, headers=headers)
         print(f"Response status: {response.status_code}")
-        
+
         if response.status_code == 200:
             data = response.json()
-            print(f"Data keys: {data.keys() if data else 'No data'}")
-            
-            # Parse the data
             candles = data.get('data', {}).get('candles', [])
             if not candles:
                 print("No candles found in response")
                 return None, None
-            
-            btc_data = pd.DataFrame(candles, 
-                                   columns=['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume', 'Extra'])
-            
+
+            btc_data = pd.DataFrame(
+                candles,
+                columns=['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume', 'Extra']
+            )
+
             btc_data['Datetime'] = pd.to_datetime(btc_data['Datetime'])
-            btc_data[['Open', 'High', 'Low', 'Close', 'Volume']] = btc_data[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
-            
-            # Add OI (Open Interest) - use Extra column if available, otherwise use Volume
+            btc_data[['Open', 'High', 'Low', 'Close', 'Volume']] = btc_data[
+                ['Open', 'High', 'Low', 'Close', 'Volume']
+            ].astype(float)
+
             if 'Extra' in btc_data.columns:
-                btc_data['OI'] = btc_data['Extra'].astype(float)
+                btc_data['OI'] = pd.to_numeric(btc_data['Extra'], errors='coerce')
+                btc_data['OI'].fillna(btc_data['Volume'], inplace=True)
             else:
-                # If no OI data, create a placeholder using Volume
                 btc_data['OI'] = btc_data['Volume'].rolling(10).mean()
                 btc_data['OI'].fillna(btc_data['Volume'], inplace=True)
-            
-            # Keep only OHLCV + OI
+
             btc_data = btc_data[['Open', 'High', 'Low', 'Close', 'Volume', 'OI']]
-            
-            # Clean data
             btc_data = clean_data(btc_data)
-            
+
             print(f"Data shape: {btc_data.shape}")
             print(f"Columns: {btc_data.columns.tolist()}")
-            
-            # Create target labels based on future price movement (TARGET_POSITION ahead)
+
             btc_data['future_price'] = btc_data['Close'].shift(-TARGET_POSITION)
             btc_data['price_change'] = btc_data['future_price'] - btc_data['Close']
-            
-            # Create labels: 0=Hold, 1=Buy (Bullish), 2=Sell (Bearish)
-            # Use quantiles for labeling
-            upper_quantile = btc_data['price_change'].quantile(0.85)  # Top 15%
-            lower_quantile = btc_data['price_change'].quantile(0.15)  # Bottom 15%
-            
+
+            upper_quantile = btc_data['price_change'].quantile(0.90)
+            lower_quantile = btc_data['price_change'].quantile(0.10)
+
             btc_data['label'] = btc_data['price_change'].apply(
                 lambda x: 1 if x > upper_quantile else 2 if x < lower_quantile else 0
             )
-            
+
             print(f"\nQuantile values:")
-            print(f"Upper quantile (85%): {upper_quantile:.4f}")
-            print(f"Lower quantile (15%): {lower_quantile:.4f}")
+            print(f"Upper quantile (90%): {upper_quantile:.4f}")
+            print(f"Lower quantile (10%): {lower_quantile:.4f}")
             print(f"Target position: {TARGET_POSITION} candles ahead")
-            
-            # Remove rows with NaN
+
             btc_data.dropna(inplace=True)
-            
+
             print(f"\nClass distribution:")
             print(btc_data['label'].value_counts())
-            
-            # Scale features
+
             scaler = MinMaxScaler(feature_range=(-1, 1))
             btc_data[FEATURES] = scaler.fit_transform(btc_data[FEATURES])
             joblib.dump(scaler, 'cnn_feature_scaler.pkl')
             print("✅ Scaler saved as 'cnn_feature_scaler.pkl'")
-            
+
             return btc_data, FEATURES
         else:
             print(f"Failed to fetch data: {response.status_code} - {response.text}")
             return None, None
-            
+
     except Exception as e:
         print(f"Error fetching data: {e}")
         import traceback
         traceback.print_exc()
         return None, None
 
+
 def create_gaf_images(data, columns, window_size):
-    """Create Gramian Angular Field images from time series data"""
+    """
+    Create Gramian Angular Field images from time series data.
+
+    For each window we build a multi-channel image of shape:
+        (n_features, window_size, window_size)
+
+    Returns array of shape (N, n_features, window_size, window_size).
+    """
     gaf = GramianAngularField(method='summation', image_size=window_size)
     gaf_images = []
-    
+
     for i in range(window_size, len(data)):
-        window_data = data.iloc[i-window_size:i][columns].values.T.astype(np.float64)
+        # shape: (window_size, n_features) -> transpose to (n_features, window_size)
+        window_data = data.iloc[i - window_size:i][columns].values.T.astype(np.float64)
         try:
-            gaf_image = gaf.fit_transform(window_data)
+            gaf_image = gaf.fit_transform(window_data)  # (n_features, W, W)
             gaf_images.append(gaf_image)
         except Exception as e:
             print(f"Error creating GAF image at index {i}: {e}")
             continue
-            
-    return np.array(gaf_images)
+
+    return np.array(gaf_images)  # (N, n_features, W, W)
+
 
 def create_cnn_model(input_shape):
-    """Create CNN model for classification"""
+    """Create CNN model for classification."""
     model = Sequential([
         Conv2D(32, (3, 3), activation='swish', padding='same', input_shape=input_shape),
         BatchNormalization(),
         MaxPooling2D(pool_size=(2, 2)),
         Dropout(0.2),
-        
+
         Conv2D(64, (3, 3), activation='swish', padding='same'),
         BatchNormalization(),
         MaxPooling2D(pool_size=(2, 2)),
         Dropout(0.2),
-        
+
         Conv2D(128, (3, 3), activation='swish', padding='same'),
         BatchNormalization(),
         MaxPooling2D(pool_size=(2, 2)),
         Dropout(0.2),
-        
+
         Flatten(),
         Dense(128, activation='swish'),
         Dropout(0.3),
         Dense(64, activation='swish'),
         Dropout(0.2),
-        Dense(3, activation='softmax')  # 3 classes: Hold, Buy, Sell
+        Dense(3, activation='softmax')  # Hold, Buy, Sell
     ])
-    
+
     model.compile(
         optimizer=Adam(learning_rate=LEARNING_RATE),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
-    
+
     return model
 
+
 def main():
-    print("="*60)
+    print("=" * 60)
     print("CNN TRAINING WITH OHLCV + OI FEATURES")
-    print("="*60)
+    print("=" * 60)
     print(f"Features: {FEATURES}")
     print(f"Window size: {WINDOW_SIZE}")
     print(f"Target position: {TARGET_POSITION} candles ahead")
-    print("="*60)
-    
+    print("=" * 60)
+
     print("\n📊 Fetching and preprocessing data...")
     btc_data, features = fetch_and_preprocess_data()
-    
+
     if btc_data is None or len(btc_data) < WINDOW_SIZE + TARGET_POSITION:
         print("❌ Error: Not enough data for training")
         return
-    
+
     print(f"✅ Data shape: {btc_data.shape}")
     print(f"✅ Features: {features}")
-    
+
     print("\n🔄 Creating GAF images...")
     gaf_images = create_gaf_images(btc_data, features, WINDOW_SIZE)
-    
+
     if len(gaf_images) == 0:
         print("❌ Error: No GAF images created")
         return
-        
+
+    # gaf_images: (N, n_features, W, W)
+    # transpose to (N, W, W, n_features) for channels-last Conv2D
     X_gaf = np.transpose(gaf_images, (0, 2, 3, 1))
     y_labels = btc_data['label'].values[WINDOW_SIZE:]
-    
+
+    # Sanity-check shapes align
+    min_len = min(len(X_gaf), len(y_labels))
+    X_gaf = X_gaf[:min_len]
+    y_labels = y_labels[:min_len]
+
     print(f"✅ GAF images shape: {X_gaf.shape}")
     print(f"✅ Labels shape: {y_labels.shape}")
     print(f"Class Distribution (Before): {np.bincount(y_labels)}")
-    
-    # Check if we have enough classes
+
     unique_classes = np.unique(y_labels)
     if len(unique_classes) < 2:
-        print(f"❌ Error: Only found {len(unique_classes)} classes. Need at least 2 classes for training.")
+        print(f"❌ Error: Only found {len(unique_classes)} classes. Need at least 2.")
         return
-    
-    # Handle class imbalance
+
     print("\n⚖️ Balancing classes using RandomOverSampler...")
     ros = RandomOverSampler(random_state=42)
     X_reshaped = X_gaf.reshape(X_gaf.shape[0], -1)
     X_resampled, y_resampled = ros.fit_resample(X_reshaped, y_labels)
     X_resampled = X_resampled.reshape(-1, WINDOW_SIZE, WINDOW_SIZE, len(features))
     print(f"Class Distribution (After): {np.bincount(y_resampled)}")
-    
-    # Split data
+
     print("\n📊 Splitting data into train and validation sets...")
     X_train, X_val, y_train, y_val = train_test_split(
         X_resampled, y_resampled, test_size=0.2, random_state=42, stratify=y_resampled)
-    
+
     print(f"Training samples: {len(X_train)}")
     print(f"Validation samples: {len(X_val)}")
-    
-    # Create and train model
+
     print("\n🧠 Creating CNN model...")
     model = create_cnn_model((WINDOW_SIZE, WINDOW_SIZE, len(features)))
     model.summary()
-    
+
     reduce_lr = ReduceLROnPlateau(
-        monitor='val_loss', 
-        factor=0.5, 
-        patience=10, 
-        min_lr=0.00001, 
-        verbose=1
+        monitor='val_loss', factor=0.5, patience=10, min_lr=1e-5, verbose=1
     )
-    
     early_stop = EarlyStopping(
-        monitor='val_loss', 
-        patience=20, 
-        restore_best_weights=True,
-        verbose=1
+        monitor='val_loss', patience=20, restore_best_weights=True, verbose=1
     )
-    
+
     print("\n🚀 Training model...")
     history = model.fit(
         X_train, y_train,
@@ -264,58 +266,51 @@ def main():
         callbacks=[reduce_lr, early_stop],
         verbose=1
     )
-    
-    # Evaluate model
+
     print("\n📊 Evaluating model...")
     y_pred = model.predict(X_val)
     y_pred_classes = np.argmax(y_pred, axis=1)
-    
-    # Get actual classes present in validation set
+
     present_classes = np.unique(y_val)
     target_names = ['Hold', 'Buy', 'Sell']
     present_target_names = [target_names[i] for i in present_classes if i < len(target_names)]
-    
+
     print("\n📈 Class distribution in validation set:")
     for i, count in enumerate(np.bincount(y_val)):
         if i < len(target_names):
             print(f"{target_names[i]}: {count}")
-    
+
     print("\n📋 Classification Report:")
     print(classification_report(y_val, y_pred_classes, target_names=present_target_names))
-    
-    # Save model
+
+    # ---- CHANGED: model saved as cnn_fixed.h5 ----
     print("\n💾 Saving model...")
-    model.save('cnn_new.h5')
-    print("✅ Model saved as 'cnn_new.h5'")
-    
-    # Save configuration
+    model.save('cnn_fixed.h5')
+    print("✅ Model saved as 'cnn_fixed.h5'")
+
+    # Save config with explicit feature count so the bot can validate
     config = {
-        'model_file': 'cnn_new.h5',
+        'model_file': 'cnn_fixed.h5',
         'features': FEATURES,
+        'feature_count': len(FEATURES),
         'window_size': WINDOW_SIZE,
         'target_position': TARGET_POSITION,
         'classes': ['Hold', 'Buy', 'Sell'],
         'class_mapping': {0: 'Hold', 1: 'Buy (Bullish)', 2: 'Sell (Bearish)'}
     }
-    
-    config_df = pd.DataFrame([config])
-    config_df.to_csv('cnn_model_config.csv', index=False)
+    pd.DataFrame([config]).to_csv('cnn_model_config.csv', index=False)
     print("✅ Configuration saved as 'cnn_model_config.csv'")
-    
-    # Calculate and send CNN accuracy from validation set
+
+    # Reload the bot
+    print("\n📡 Notifying trading bot to reload CNN model...")
     try:
-        # Get validation accuracy
-        val_accuracy = history.history['val_accuracy'][-1] if history.history.get('val_accuracy') else 0.85
-        val_accuracy = float(val_accuracy)
-        
-        # Send CNN accuracy to trading bot
         response = requests.post(
-            "http://localhost:5000/update", 
-            json={"CNN": val_accuracy}
+            "http://localhost:5000/update",
+            json={"Updated": "CNN"},
+            timeout=5
         )
         if response.status_code == 200:
-            print(f"✅ Updated trading bot with CNN accuracy: {val_accuracy:.4f}")
-            print(f"   Response: {response.json()}")
+            print(f"✅ Trading bot notified. Response: {response.json()}")
         else:
             print(f"⚠️ Could not update trading bot (status: {response.status_code})")
             print(f"   Response: {response.text}")
@@ -323,20 +318,21 @@ def main():
         print("⚠️ Trading bot not running or unreachable")
     except Exception as e:
         print(f"⚠️ Error updating trading bot: {e}")
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("✅ CNN TRAINING COMPLETE")
-    print("="*60)
-    print(f"📁 Model saved: cnn_new.h5")
+    print("=" * 60)
+    print(f"📁 Model saved: cnn_fixed.h5")
     print(f"📁 Scaler saved: cnn_feature_scaler.pkl")
     print(f"📁 Config saved: cnn_model_config.csv")
-    print(f"Features used: {FEATURES}")
+    print(f"Features used: {FEATURES}  ({len(FEATURES)} channels)")
     print(f"Target position: {TARGET_POSITION} candles ahead")
-    print("="*60)
+    print("=" * 60)
+
 
 if __name__ == "__main__":
+    # NOTE: Do NOT loop forever here — each retrain overwrites cnn_fixed.h5
+    # and it's expensive. If you want continuous retraining, uncomment.
+    # main()
     while True:
         main()
-    print("\n" + "="*60)
-    print("🔄 Training completed.")
-    print("="*60 + "\n")
