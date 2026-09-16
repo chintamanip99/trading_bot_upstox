@@ -25,12 +25,19 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # CONFIGURABLE PARAMETERS
 # ============================================================
-LOT_SIZE = 65
+LOT_SIZE = 10
 INITIAL_BALANCE = 100000
 
-# --- STATIC TARGET / STOP LOSS ---
-STOP_LOSS_PCT = 0.04   # 4% stop loss
-TARGET_PCT    = 0.01   # 1% target
+# --- DYNAMIC TARGET / STOP LOSS (based on LSTM predicted move) ---
+# The bot computes target & SL per trade from |predicted move|.
+# These multipliers control how aggressive the target / SL are
+# relative to the LSTM's predicted absolute price move.
+TARGET_MULT = 1.0    # target = TARGET_MULT * |predicted_move|
+SL_MULT     = 1.0    # SL     = SL_MULT     * |predicted_move|
+MIN_TARGET_PCT = 0.005   # floor: 0.5%  (avoid tiny targets)
+MAX_TARGET_PCT = 0.04    # cap:   4.0%  (avoid absurd targets)
+MIN_SL_PCT     = 0.005   # floor: 0.5%
+MAX_SL_PCT     = 0.04    # cap:   4.0%
 
 MAX_CONSECUTIVE_LOSSES = 5
 ORDER_RETRY_DELAY = 1
@@ -40,34 +47,31 @@ CAPITAL_UTILIZATION = 1.0
 # ============================================================
 # LOOSENED THRESHOLDS - still requires 2-model consensus
 # ============================================================
-CONFIDENCE_THRESHOLD = 0.45     # ensemble gate (loosened)
-CNN_THRESHOLD        = 0.45     # CNN must beat this to emit signal (loosened)
+CONFIDENCE_THRESHOLD = 0.45
+CNN_THRESHOLD        = 0.45
 
-MIN_LSTM_CONFIDENCE  = 0.35     # LSTM floor (loosened)
-MIN_CNN_CONFIDENCE   = 0.45     # CNN floor (loosened)
+MIN_LSTM_CONFIDENCE  = 0.35
+MIN_CNN_CONFIDENCE   = 0.45
 
 STRICT_CONSENSUS        = True
 REQUIRE_BOTH_ACTIONABLE = True
 
-MIN_PREDICTED_MOVE_PCT = 0.002  # 0.2% predicted move (loosened)
+MIN_PREDICTED_MOVE_PCT = 0.002  # 0.2%
 
 # ---- LSTM confidence scaling ----
-# confidence = min(CAP, |pred_move| * SCALE)
-# With SCALE=100: 0.20% -> 0.20, 0.35% -> 0.35, 0.50% -> 0.50, 0.80% -> 0.80
 LSTM_CONF_SCALE = 100.0
 LSTM_CONF_CAP   = 0.95
 
-# ---- Anti-false-signal filters (relaxed) ----
-CNN_MIN_LEAD           = 0.08   # CNN winner class must lead runner-up by this margin
-LSTM_DIRECTIONAL_AGREE = True   # LSTM predicted return sign must match signal direction
-MIN_MODEL_AGREEMENT_TICKS = 1   # 1 = no consecutive-tick requirement
+# ---- Anti-false-signal filters ----
+CNN_MIN_LEAD           = 0.08
+LSTM_DIRECTIONAL_AGREE = True
+MIN_MODEL_AGREEMENT_TICKS = 1
 SIGNAL_COOLDOWN_TICKS  = 1
 
 SL_TRIGGER_BUFFER = 0.005
-MAX_TRADES_PER_DAY = 30         # reasonable cap
+MAX_TRADES_PER_DAY = 30
 REGIME_FILTER_ENABLED = True
 
-# ---- Debug flag ----
 DEBUG_GATES = True
 
 # ============================================================
@@ -88,16 +92,22 @@ app = Flask(__name__)
 cors = CORS(app)
 app.config['CORS_HEADERS'] = 'Content-Type'
 
-lstm_mae = 6.2598
+# ---- LSTM MAE in PRICE units (from training) ----
+LSTM_MAE = 6.2598
+lstm_mae = LSTM_MAE  # keep the old global name for API compatibility
+
 cnn_accuracy = 0.82
 g_current_status = "Initializing..."
 predicted_next_close = 0
 
+# ============================================================
+# UPDATED CREDENTIALS / INSTRUMENTS
+# ============================================================
 UPSTOX_API_KEY = "5d4f0968-84a2-4db3-8622-0287bef615e8"
-UPSTOX_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzMjc3NTkiLCJqdGkiOiI2YWE4YzdkODVhNjRjYzI5YjQxNDZhMzgiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzg5NDQ2MTA0LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3ODk1MDk2MDB9.qKXM5kDeOva3YFY8MDsPhE0--flncqHSzb_UHhHHmio"
+UPSTOX_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzMjc3NTkiLCJqdGkiOiI2YWFhMWM0NGI2YmI2ZTVkNDFiZjIwNzIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzg5NTMzMjUyLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3ODk1OTYwMDB9.UVwMwvh9Y69p0u_cw-5i3AHoN5cNzJidKQ-w3uEcdZs"
 
-INSTRUMENT_TOKEN_CE = "NSE_FO|56995"
-INSTRUMENT_TOKEN_PE = "NSE_FO|56996"
+INSTRUMENT_TOKEN_CE = "MCX_FO|576714"
+INSTRUMENT_TOKEN_PE = "MCX_FO|576868"
 
 ce_price = 0
 pe_price = 0
@@ -119,14 +129,15 @@ cnn_scaler = None
 
 last_processed_minute = None
 live_data = []
+live_df = None
 
 trades_today = 0
 current_trade_date = None
 
 latest_lstm_predicted_return = 0.0
 latest_lstm_predicted_price = 0.0
+latest_lstm_close_diff = 0.0   # (predicted_price - current_price)
 
-# ---- Consecutive agreement tracking ----
 agreement_history = []
 ticks_since_last_eval = 0
 
@@ -152,8 +163,8 @@ class PaperTradingBot:
         self.max_hold_time = MAX_HOLD_TIME
         self.current_instrument = None
 
-        self.active_target_pct = TARGET_PCT
-        self.active_sl_pct = STOP_LOSS_PCT
+        self.active_target_pct = MIN_TARGET_PCT
+        self.active_sl_pct = MIN_SL_PCT
 
         self.total_trades = 0
         self.winning_trades = 0
@@ -363,7 +374,7 @@ class PaperTradingBot:
 
     def execute_paper_trade(self, final_signal, ce_price, pe_price, ensemble_confidence, model_signals):
         global trade_log_global, recent_trades, current_position, trades_today, current_trade_date
-        global latest_lstm_predicted_return
+        global latest_lstm_predicted_return, latest_lstm_close_diff
 
         today = datetime.datetime.now().date()
         if current_trade_date != today:
@@ -390,7 +401,6 @@ class PaperTradingBot:
         if final_signal not in (1, 2):
             return
 
-        # ----- EXTRA CONSENSUS GATES -----
         lstm_conf = model_signals.get('lstm_conf', 0)
         cnn_conf  = model_signals.get('cnn_conf', 0)
         lstm_sig  = model_signals.get('lstm', 0)
@@ -437,9 +447,34 @@ class PaperTradingBot:
             return
 
         # ============================================================
-        # STATIC TARGET / SL
+        # |close_diff| > lstm_mae GATE  (in price units)
         # ============================================================
-        pred_move_pct = abs(latest_lstm_predicted_return)
+        abs_close_diff = abs(latest_lstm_close_diff)
+        if abs_close_diff <= LSTM_MAE:
+            if DEBUG_GATES:
+                print(f"⚠️ Entry blocked: |close_diff|={abs_close_diff:.4f} "
+                      f"<= LSTM_MAE={LSTM_MAE:.4f} (model has no edge)")
+            return
+
+        # ============================================================
+        # DYNAMIC TARGET / SL  (based on LSTM's predicted move %)
+        # ============================================================
+        pred_move_pct = abs(latest_lstm_predicted_return)   # fractional (e.g. 0.012 = 1.2%)
+
+        # Require the predicted move to also exceed the MAE as a *fraction*
+        # (consistency guard: the price-space gate and %-space gate agree)
+        # Use current price reference for the MAE-to-pct conversion.
+        ref_price = ce_price if final_signal == 1 else pe_price
+        if ref_price > 0:
+            mae_pct = LSTM_MAE / ref_price
+        else:
+            mae_pct = 0.0
+
+        if pred_move_pct < mae_pct:
+            if DEBUG_GATES:
+                print(f"⚠️ Entry blocked: pred_move {pred_move_pct*100:.3f}% "
+                      f"< MAE% {mae_pct*100:.3f}%")
+            return
 
         if pred_move_pct < MIN_PREDICTED_MOVE_PCT:
             if DEBUG_GATES:
@@ -447,18 +482,25 @@ class PaperTradingBot:
                       f"< {MIN_PREDICTED_MOVE_PCT*100:.2f}%")
             return
 
-        static_target_pct = TARGET_PCT
-        static_sl_pct = STOP_LOSS_PCT
+        # Target / SL derived from |predicted_move|, then clamped to sane bounds
+        raw_target_pct = TARGET_MULT * pred_move_pct
+        raw_sl_pct     = SL_MULT     * pred_move_pct
 
-        self.active_target_pct = static_target_pct
-        self.active_sl_pct = static_sl_pct
+        dynamic_target_pct = float(np.clip(raw_target_pct, MIN_TARGET_PCT, MAX_TARGET_PCT))
+        dynamic_sl_pct     = float(np.clip(raw_sl_pct,     MIN_SL_PCT,     MAX_SL_PCT))
 
-        actual_rr = round(static_target_pct / static_sl_pct, 2)
+        self.active_target_pct = dynamic_target_pct
+        self.active_sl_pct     = dynamic_sl_pct
 
-        print(f"\n📐 STATIC TARGET/SL:")
-        print(f"   LSTM predicted move:   {pred_move_pct*100:.3f}%")
-        print(f"   → Target (fixed):      {static_target_pct*100:.3f}%")
-        print(f"   → SL (fixed):          {static_sl_pct*100:.3f}%")
+        actual_rr = round(dynamic_target_pct / dynamic_sl_pct, 2) if dynamic_sl_pct > 0 else 0
+
+        print(f"\n📐 DYNAMIC TARGET/SL:")
+        print(f"   LSTM predicted move:   {pred_move_pct*100:.3f}%  "
+              f"(close_diff={latest_lstm_close_diff:+.4f}, MAE={LSTM_MAE:.4f})")
+        print(f"   → Target (raw):        {raw_target_pct*100:.3f}%")
+        print(f"   → Target (clamped):    {dynamic_target_pct*100:.3f}%")
+        print(f"   → SL (raw):            {raw_sl_pct*100:.3f}%")
+        print(f"   → SL (clamped):        {dynamic_sl_pct*100:.3f}%")
         print(f"   → Actual R:R:          1:{actual_rr}")
 
         trade_log = ""
@@ -475,8 +517,8 @@ class PaperTradingBot:
                     print("⚠️ Not enough balance for even 1 lot — skipping")
                     return
 
-                target_price = round(entry_price * (1 + static_target_pct), 2)
-                stop_loss_price = round(entry_price * (1 - static_sl_pct), 2)
+                target_price = round(entry_price * (1 + dynamic_target_pct), 2)
+                stop_loss_price = round(entry_price * (1 - dynamic_sl_pct), 2)
 
                 trade_value = entry_price * shares
                 entry_fees = self.calculate_fees(trade_value, side='entry')
@@ -516,9 +558,10 @@ class PaperTradingBot:
                     f"📈 BUY CE @ {entry_price:.2f} | "
                     f"Lots: {shares//self.lot_size} ({shares} qty) | "
                     f"Investment: {trade_value:,.2f} | "
-                    f"PredMove: {pred_move_pct*100:.2f}% | "
-                    f"Target: {target_price} (+{static_target_pct*100:.2f}%, +{expected_profit:,.2f}) | "
-                    f"SL: {stop_loss_price} (-{static_sl_pct*100:.2f}%, -{abs(expected_loss):,.2f}) | "
+                    f"PredMove: {pred_move_pct*100:.2f}% "
+                    f"(close_diff={latest_lstm_close_diff:+.3f}, MAE={LSTM_MAE:.3f}) | "
+                    f"Target: {target_price} (+{dynamic_target_pct*100:.2f}%, +{expected_profit:,.2f}) | "
+                    f"SL: {stop_loss_price} (-{dynamic_sl_pct*100:.2f}%, -{abs(expected_loss):,.2f}) | "
                     f"R:R: 1:{actual_rr} | "
                     f"EnsConf: {ensemble_confidence:.3f} "
                     f"[L={lstm_conf:.2f} C={cnn_conf:.2f}] | "
@@ -532,8 +575,8 @@ class PaperTradingBot:
                     print("⚠️ Not enough balance for even 1 lot — skipping")
                     return
 
-                target_price = round(entry_price * (1 + static_target_pct), 2)
-                stop_loss_price = round(entry_price * (1 - static_sl_pct), 2)
+                target_price = round(entry_price * (1 + dynamic_target_pct), 2)
+                stop_loss_price = round(entry_price * (1 - dynamic_sl_pct), 2)
 
                 trade_value = entry_price * shares
                 entry_fees = self.calculate_fees(trade_value, side='entry')
@@ -573,9 +616,10 @@ class PaperTradingBot:
                     f"📉 BUY PE @ {entry_price:.2f} | "
                     f"Lots: {shares//self.lot_size} ({shares} qty) | "
                     f"Investment: {trade_value:,.2f} | "
-                    f"PredMove: {pred_move_pct*100:.2f}% | "
-                    f"Target: {target_price} (+{static_target_pct*100:.2f}%, +{expected_profit:,.2f}) | "
-                    f"SL: {stop_loss_price} (-{static_sl_pct*100:.2f}%, -{abs(expected_loss):,.2f}) | "
+                    f"PredMove: {pred_move_pct*100:.2f}% "
+                    f"(close_diff={latest_lstm_close_diff:+.3f}, MAE={LSTM_MAE:.3f}) | "
+                    f"Target: {target_price} (+{dynamic_target_pct*100:.2f}%, +{expected_profit:,.2f}) | "
+                    f"SL: {stop_loss_price} (-{dynamic_sl_pct*100:.2f}%, -{abs(expected_loss):,.2f}) | "
                     f"R:R: 1:{actual_rr} | "
                     f"EnsConf: {ensemble_confidence:.3f} "
                     f"[L={lstm_conf:.2f} C={cnn_conf:.2f}] | "
@@ -648,9 +692,9 @@ def market_regime_ok(price_data, window=10):
     volatility = float(np.std(returns))
     trend = float((recent[-1] - recent[0]) / recent[0])
 
-    if volatility > 0.012:      # loosened from 0.008
+    if volatility > 0.012:
         return False
-    if abs(trend) < 0.001:      # loosened from 0.002
+    if abs(trend) < 0.001:
         return False
     return True
 
@@ -667,18 +711,18 @@ def load_all_models():
     models_loaded = {'lstm': False, 'cnn': False}
 
     try:
-        lstm_model = load_model("lstm_new.h5", compile=False)
+        lstm_model = load_model("lstm_fixed.h5", compile=False)
         models_loaded['lstm'] = True
-        print("✅ LSTM model loaded")
+        print("✅ LSTM model loaded (lstm_fixed.h5)")
         print(f"   Expected input shape: {lstm_model.input_shape}")
     except Exception as e:
         print(f"❌ Error loading LSTM: {e}")
         lstm_model = None
 
     try:
-        cnn_model = load_model("cnn_new.h5", compile=False)
+        cnn_model = load_model("cnn_fixed.h5", compile=False)
         models_loaded['cnn'] = True
-        print("✅ CNN model loaded")
+        print("✅ CNN model loaded (cnn_fixed.h5)")
         print(f"   Expected input shape: {cnn_model.input_shape}")
     except Exception as e:
         print(f"❌ Error loading CNN: {e}")
@@ -753,76 +797,94 @@ def fetch_and_preprocess_data():
         return None
 
 
-def predict_lstm(price_data, current_price):
-    global model_predictions, lstm_scaler, target_scaler, latest_lstm_predicted_return, latest_lstm_predicted_price
+def predict_lstm(feature_df, current_price):
+    global model_predictions, lstm_scaler, target_scaler
+    global latest_lstm_predicted_return, latest_lstm_predicted_price, latest_lstm_close_diff
 
     try:
-        if lstm_model is None or len(price_data) < LSTM_LOOKBACK:
+        if lstm_model is None or feature_df is None or len(feature_df) < LSTM_LOOKBACK:
             model_predictions['lstm'] = {'signal': 0, 'confidence': 0.0,
                                           'prediction': current_price, 'predicted_return': 0.0}
             latest_lstm_predicted_return = 0.0
             latest_lstm_predicted_price = current_price
+            latest_lstm_close_diff = 0.0
             return
 
-        df = pd.DataFrame({
-            'Open': price_data[-LSTM_LOOKBACK:],
-            'High': price_data[-LSTM_LOOKBACK:],
-            'Low': price_data[-LSTM_LOOKBACK:],
-            'Close': price_data[-LSTM_LOOKBACK:],
-            'Volume': [1000] * LSTM_LOOKBACK,
-            'OI': [5000] * LSTM_LOOKBACK
-        })
-
-        feature_data = df[LSTM_FEATURES].values
+        window = feature_df[LSTM_FEATURES].iloc[-LSTM_LOOKBACK:].values
 
         try:
-            lstm_scaled = lstm_scaler.transform(feature_data)
+            lstm_scaled = lstm_scaler.transform(window)
         except Exception as e:
             print(f"❌ LSTM scaler failed: {e}")
             model_predictions['lstm'] = {'signal': 0, 'confidence': 0.0,
                                           'prediction': current_price, 'predicted_return': 0.0}
             latest_lstm_predicted_return = 0.0
             latest_lstm_predicted_price = current_price
+            latest_lstm_close_diff = 0.0
             return
 
         lstm_X = lstm_scaled.reshape(1, LSTM_LOOKBACK, len(LSTM_FEATURES))
-        predicted_scaled = lstm_model.predict(lstm_X, verbose=0)[0][0]
+        predicted_scaled = float(lstm_model.predict(lstm_X, verbose=0)[0][0])
+
+        if predicted_scaled < -0.5 or predicted_scaled > 1.5:
+            print(f"⚠️ LSTM output out of range: {predicted_scaled:.4f} → rejecting")
+            model_predictions['lstm'] = {'signal': 0, 'confidence': 0.0,
+                                          'prediction': current_price, 'predicted_return': 0.0}
+            latest_lstm_predicted_return = 0.0
+            latest_lstm_predicted_price = current_price
+            latest_lstm_close_diff = 0.0
+            return
+
+        predicted_scaled = float(np.clip(predicted_scaled, 0.0, 1.0))
 
         try:
-            predicted_price = target_scaler.inverse_transform([[predicted_scaled]])[0][0]
+            predicted_price = float(
+                target_scaler.inverse_transform([[predicted_scaled]])[0][0]
+            )
         except Exception as e:
             print(f"❌ LSTM inverse scaler failed: {e}")
             model_predictions['lstm'] = {'signal': 0, 'confidence': 0.0,
                                           'prediction': current_price, 'predicted_return': 0.0}
             latest_lstm_predicted_return = 0.0
             latest_lstm_predicted_price = current_price
+            latest_lstm_close_diff = 0.0
             return
 
+        if current_price > 0:
+            max_sane = current_price * 1.15
+            min_sane = current_price * 0.85
+            if predicted_price > max_sane or predicted_price < min_sane:
+                print(f"⚠️ LSTM predicted price {predicted_price:.2f} "
+                      f"outside ±15% of current {current_price:.2f} → clamping")
+                predicted_price = float(np.clip(predicted_price, min_sane, max_sane))
+
         predicted_return = (predicted_price - current_price) / current_price if current_price > 0 else 0.0
+        close_diff = predicted_price - current_price
 
         latest_lstm_predicted_return = predicted_return
         latest_lstm_predicted_price = predicted_price
+        latest_lstm_close_diff = close_diff
 
-        price_diff = predicted_price - current_price
         price_diff_pct = abs(predicted_return)
 
         if price_diff_pct < MIN_PREDICTED_MOVE_PCT:
             signal = 0
             confidence = 0.0
         else:
-            # SCALE=100 → 0.20% → 0.20, 0.35% → 0.35, 0.50% → 0.50, 0.80% → 0.80
             confidence = min(LSTM_CONF_CAP, price_diff_pct * LSTM_CONF_SCALE)
-            signal = 1 if price_diff > 0 else 2
+            signal = 1 if close_diff > 0 else 2
 
         model_predictions['lstm'] = {
             'signal': signal,
             'confidence': confidence,
             'prediction': predicted_price,
-            'predicted_return': predicted_return
+            'predicted_return': predicted_return,
+            'close_diff': close_diff
         }
 
         print(f"📊 LSTM: Sig={signal}, Conf={confidence:.3f}, "
-              f"Pred={predicted_price:.2f}, PredRet={predicted_return*100:+.3f}%")
+              f"Pred={predicted_price:.2f}, PredRet={predicted_return*100:+.3f}%, "
+              f"close_diff={close_diff:+.4f} (MAE={LSTM_MAE:.4f})")
 
     except Exception as e:
         print(f"❌ LSTM prediction error: {e}")
@@ -831,29 +893,21 @@ def predict_lstm(price_data, current_price):
                                       'prediction': current_price, 'predicted_return': 0.0}
         latest_lstm_predicted_return = 0.0
         latest_lstm_predicted_price = current_price
+        latest_lstm_close_diff = 0.0
 
 
-def predict_cnn(price_data, current_price):
+def predict_cnn(feature_df, current_price):
     global model_predictions, cnn_scaler
 
     try:
-        if cnn_model is None or len(price_data) < CNN_LOOKBACK:
+        if cnn_model is None or feature_df is None or len(feature_df) < CNN_LOOKBACK:
             model_predictions['cnn'] = {'signal': 0, 'confidence': 0.0, 'class_prob': 0.5}
             return
 
-        df = pd.DataFrame({
-            'Open': price_data[-CNN_LOOKBACK:],
-            'High': price_data[-CNN_LOOKBACK:],
-            'Low': price_data[-CNN_LOOKBACK:],
-            'Close': price_data[-CNN_LOOKBACK:],
-            'Volume': [1000] * CNN_LOOKBACK,
-            'OI': [5000] * CNN_LOOKBACK
-        })
-
-        feature_data = df[CNN_FEATURES].values
+        window = feature_df[CNN_FEATURES].iloc[-CNN_LOOKBACK:].values
 
         try:
-            cnn_values = cnn_scaler.transform(feature_data)
+            cnn_values = cnn_scaler.transform(window)
         except Exception as e:
             print(f"❌ CNN scaler failed: {e}")
             model_predictions['cnn'] = {'signal': 0, 'confidence': 0.0, 'class_prob': 0.5}
@@ -874,7 +928,6 @@ def predict_cnn(price_data, current_price):
         class_probabilities = softmax(cnn_pred).numpy()[0]
         class_prob = float(class_probabilities[predicted_class])
 
-        # ---- CNN margin filter (relaxed) ----
         sorted_probs = np.sort(class_probabilities)[::-1]
         lead = float(sorted_probs[0] - sorted_probs[1])
 
@@ -882,7 +935,6 @@ def predict_cnn(price_data, current_price):
               f"Buy={class_probabilities[1]:.3f}, Sell={class_probabilities[2]:.3f} | "
               f"lead={lead:.3f}")
 
-        # ---- Loosened CNN threshold + relaxed margin ----
         if predicted_class == 1 and class_prob > CNN_THRESHOLD and lead >= CNN_MIN_LEAD:
             signal = 1
         elif predicted_class == 2 and class_prob > CNN_THRESHOLD and lead >= CNN_MIN_LEAD:
@@ -907,26 +959,19 @@ def predict_cnn(price_data, current_price):
 
 
 def ensemble_signal_generation(current_price):
-    """
-    Loosened strict ensemble (still requires 2-model consensus):
-      - Both models must be non-zero and agree on direction.
-      - Both must individually exceed their (loosened) confidence floors.
-      - CNN must have a modest lead over runner-up class.
-      - LSTM predicted-return direction must match signal direction.
-      - Ensemble confidence = MIN(lstm_conf, cnn_conf).
-    """
     global agreement_history, ticks_since_last_eval
 
     try:
         lstm_signal = model_predictions['lstm']['signal']
         lstm_conf   = model_predictions['lstm']['confidence']
         lstm_ret    = model_predictions['lstm']['predicted_return']
+        lstm_diff   = model_predictions['lstm'].get('close_diff', 0.0)
         cnn_signal  = model_predictions['cnn']['signal']
         cnn_conf    = model_predictions['cnn']['confidence']
         cnn_lead    = model_predictions['cnn'].get('lead', 0.0)
 
-        print(f"📊 Raw - LSTM: {lstm_signal} ({lstm_conf:.3f}, ret={lstm_ret*100:+.3f}%), "
-              f"CNN: {cnn_signal} ({cnn_conf:.3f}, lead={cnn_lead:.3f})")
+        print(f"📊 Raw - LSTM: {lstm_signal} ({lstm_conf:.3f}, ret={lstm_ret*100:+.3f}%, "
+              f"diff={lstm_diff:+.4f}), CNN: {cnn_signal} ({cnn_conf:.3f}, lead={cnn_lead:.3f})")
 
         agreement_history.append((lstm_signal, cnn_signal))
         if len(agreement_history) > 10:
@@ -943,44 +988,43 @@ def ensemble_signal_generation(current_price):
                 'reject_reason': reason
             }
 
-        # Gate 1: both actionable
+        # ---- MAE gate at ensemble level ----
+        if abs(lstm_diff) <= LSTM_MAE:
+            return _reject(
+                f"|close_diff|={abs(lstm_diff):.4f} <= LSTM_MAE={LSTM_MAE:.4f}"
+            )
+
         if REQUIRE_BOTH_ACTIONABLE and (lstm_signal == 0 or cnn_signal == 0):
             return _reject(
                 f"both must be actionable (LSTM={lstm_signal}, CNN={cnn_signal})"
             )
 
-        # Gate 2: agree on direction
         if lstm_signal != cnn_signal:
             return _reject(
                 f"models disagree (LSTM={lstm_signal}, CNN={cnn_signal})"
             )
 
-        # Gate 3: LSTM directional sanity check
         if LSTM_DIRECTIONAL_AGREE:
             if lstm_signal == 1 and lstm_ret <= 0:
                 return _reject(f"LSTM signal=1 but pred_ret={lstm_ret*100:+.3f}% (not bullish)")
             if lstm_signal == 2 and lstm_ret >= 0:
                 return _reject(f"LSTM signal=2 but pred_ret={lstm_ret*100:+.3f}% (not bearish)")
 
-        # Gate 4: LSTM floor (loosened)
         if lstm_conf < MIN_LSTM_CONFIDENCE:
             return _reject(
                 f"LSTM conf {lstm_conf:.3f} < {MIN_LSTM_CONFIDENCE}"
             )
 
-        # Gate 5: CNN floor (loosened)
         if cnn_conf < MIN_CNN_CONFIDENCE:
             return _reject(
                 f"CNN conf {cnn_conf:.3f} < {MIN_CNN_CONFIDENCE}"
             )
 
-        # Gate 6: CNN margin (relaxed)
         if cnn_lead < CNN_MIN_LEAD:
             return _reject(
                 f"CNN lead {cnn_lead:.3f} < {CNN_MIN_LEAD}"
             )
 
-        # Gate 7: consecutive-tick agreement (skipped if MIN_MODEL_AGREEMENT_TICKS == 1)
         if MIN_MODEL_AGREEMENT_TICKS > 1:
             needed = MIN_MODEL_AGREEMENT_TICKS
             tail = agreement_history[-needed:]
@@ -992,7 +1036,6 @@ def ensemble_signal_generation(current_price):
                     f"({len(tail)}/{needed} ticks with same signal)"
                 )
 
-        # Consensus achieved
         final_signal = lstm_signal
         consensus_type = "BOTH_AGREE_STRICT"
         ensemble_confidence = min(lstm_conf, cnn_conf)
@@ -1001,7 +1044,6 @@ def ensemble_signal_generation(current_price):
               f"EnsConf(min)={ensemble_confidence:.3f} "
               f"[L={lstm_conf:.3f}, C={cnn_conf:.3f}]")
 
-        # Gate 8: ensemble threshold
         if ensemble_confidence < CONFIDENCE_THRESHOLD:
             print(f"❌ REJECT: ensemble conf {ensemble_confidence:.3f} "
                   f"< {CONFIDENCE_THRESHOLD}")
@@ -1031,7 +1073,7 @@ def ensemble_signal_generation(current_price):
 
 def update_status_ensemble(ce_price, pe_price, final_signal, ensemble_confidence, model_signals):
     global current_status, g_current_status, last_prediction_time, paper_trading_bot
-    global latest_lstm_predicted_return
+    global latest_lstm_predicted_return, latest_lstm_close_diff
 
     last_prediction_time = datetime.datetime.now()
     stats = paper_trading_bot.get_performance_stats()
@@ -1059,7 +1101,8 @@ def update_status_ensemble(ce_price, pe_price, final_signal, ensemble_confidence
         dyn_info = (f"Tgt:{paper_trading_bot.active_target_pct*100:.2f}% "
                     f"SL:{paper_trading_bot.active_sl_pct*100:.2f}%")
     else:
-        dyn_info = f"PredRet:{latest_lstm_predicted_return*100:+.2f}%"
+        dyn_info = (f"diff:{latest_lstm_close_diff:+.3f}/MAE:{LSTM_MAE:.2f} "
+                    f"ret:{latest_lstm_predicted_return*100:+.2f}%")
 
     current_status = (
         f"CE:{ce_price:.2f} PE:{pe_price:.2f} | "
@@ -1077,24 +1120,25 @@ def update_status_ensemble(ce_price, pe_price, final_signal, ensemble_confidence
     return current_status
 
 
-def predict_with_ensemble(price_data, ce_price, pe_price):
+def predict_with_ensemble(feature_df, ce_price, pe_price):
     try:
         global current_status, predicted_next_close, last_price, g_current_status, last_signal
 
-        if len(price_data) < lookback:
-            g_current_status = f"Data {len(price_data)}/{lookback}"
+        if feature_df is None or len(feature_df) < lookback:
+            g_current_status = f"Data {0 if feature_df is None else len(feature_df)}/{lookback}"
             return
 
-        current_price = price_data[-1]
+        current_price = float(feature_df['Close'].iloc[-1])
         last_price = current_price
 
-        predict_lstm(price_data, current_price)
-        predict_cnn(price_data, current_price)
+        predict_lstm(feature_df, current_price)
+        predict_cnn(feature_df, current_price)
 
         print(f"\n🔎 CONFIDENCE DEBUG: "
               f"LSTM sig={model_predictions['lstm']['signal']} "
               f"conf={model_predictions['lstm']['confidence']:.4f} "
-              f"pred_ret={model_predictions['lstm']['predicted_return']*100:.3f}% | "
+              f"pred_ret={model_predictions['lstm']['predicted_return']*100:.3f}% "
+              f"diff={latest_lstm_close_diff:+.4f} | "
               f"CNN sig={model_predictions['cnn']['signal']} "
               f"conf={model_predictions['cnn']['confidence']:.4f}")
 
@@ -1114,7 +1158,7 @@ def predict_with_ensemble(price_data, ce_price, pe_price):
 
 
 def start_websocket():
-    global live_data, g_current_status, ce_price, pe_price, ce_data, pe_data
+    global live_data, live_df, g_current_status, ce_price, pe_price, ce_data, pe_data
     tick_count = 0
     ce_tick_count = 0
     pe_tick_count = 0
@@ -1124,7 +1168,7 @@ def start_websocket():
         g_current_status = f"WebSocket error: {error}"
 
     def on_message(message):
-        global live_data, last_price, g_current_status, ce_price, pe_price, ce_data, pe_data
+        global live_data, live_df, last_price, g_current_status, ce_price, pe_price, ce_data, pe_data
         nonlocal tick_count, ce_tick_count, pe_tick_count
 
         try:
@@ -1201,6 +1245,16 @@ def start_websocket():
 
             tick_count += 1
 
+            if ce_price > 0 and live_df is not None:
+                new_row = live_df.iloc[-1].copy()
+                new_row['Close'] = ce_price
+                new_row['High'] = max(new_row['High'], ce_price)
+                new_row['Low'] = min(new_row['Low'], ce_price) if new_row['Low'] > 0 else ce_price
+                new_row['Open'] = new_row['Close']
+                live_df = pd.concat([live_df, new_row.to_frame().T], ignore_index=True)
+                if len(live_df) > lookback + 5:
+                    live_df = live_df.iloc[-(lookback + 5):].reset_index(drop=True)
+
             if ce_price > 0:
                 last_price = ce_price
                 if len(live_data) >= lookback:
@@ -1228,8 +1282,9 @@ def start_websocket():
                 f"{datetime.datetime.now().strftime('%H:%M:%S')}"
             )
 
-            if len(live_data) >= lookback and ce_price > 0 and pe_price > 0:
-                predict_with_ensemble(live_data, ce_price, pe_price)
+            if (live_df is not None and len(live_df) >= lookback
+                    and ce_price > 0 and pe_price > 0):
+                predict_with_ensemble(live_df, ce_price, pe_price)
 
             if tick_count % 30 == 0:
                 sys.stdout.write(f"\r{g_current_status}")
@@ -1270,7 +1325,7 @@ def start_websocket():
 @app.route('/update', methods=['POST'])
 @cross_origin()
 def update():
-    global lstm_mae, cnn_accuracy, g_current_status, lstm_model, cnn_model
+    global lstm_mae, cnn_accuracy, g_current_status, lstm_model, cnn_model, LSTM_MAE
     try:
         data = request.get_json()
 
@@ -1280,7 +1335,8 @@ def update():
             return jsonify({'message': 'Models reloaded', 'models_loaded': models_loaded}), 200
 
         if 'LSTM' in data:
-            lstm_mae = float(data['LSTM'])
+            LSTM_MAE = float(data['LSTM'])
+            lstm_mae = LSTM_MAE
             return jsonify({'message': 'LSTM MAE updated', 'lstm_mae': lstm_mae}), 200
 
         if 'CNN' in data:
@@ -1288,7 +1344,8 @@ def update():
             return jsonify({'message': 'CNN Accuracy updated', 'cnn_accuracy': cnn_accuracy}), 200
 
         if 'LSTM_MAE' in data and 'CNN_ACC' in data:
-            lstm_mae = float(data['LSTM_MAE'])
+            LSTM_MAE = float(data['LSTM_MAE'])
+            lstm_mae = LSTM_MAE
             cnn_accuracy = float(data['CNN_ACC'])
             return jsonify({'message': 'Metrics updated'}), 200
 
@@ -1301,13 +1358,14 @@ def update():
 @app.route('/update_metrics', methods=['POST'])
 @cross_origin()
 def update_metrics():
-    global lstm_mae, cnn_accuracy, g_current_status
+    global lstm_mae, cnn_accuracy, g_current_status, LSTM_MAE
     try:
         data = request.get_json()
         updates = []
 
         if 'lstm_mae' in data:
-            lstm_mae = float(data['lstm_mae'])
+            LSTM_MAE = float(data['lstm_mae'])
+            lstm_mae = LSTM_MAE
             updates.append(f"LSTM_MAE={lstm_mae:.4f}")
 
         if 'cnn_accuracy' in data:
@@ -1365,13 +1423,14 @@ def serve_trade_logs():
             'active_sl_pct': paper_trading_bot.active_sl_pct * 100,
             'latest_lstm_predicted_return': latest_lstm_predicted_return * 100,
             'latest_lstm_predicted_price': latest_lstm_predicted_price,
+            'latest_lstm_close_diff': latest_lstm_close_diff,
             'last_signal': int(last_signal),
             'predicted_next_close': float(predicted_next_close) if predicted_next_close else 0,
             'server_time': datetime.datetime.now().isoformat(),
             'trading_mode': 'PAPER_ONLY',
-            'model_type': 'ENSEMBLE (LSTM+CNN) LOOSE-STRICT',
+            'model_type': 'ENSEMBLE (LSTM+CNN) DYNAMIC-TGT/SL [lstm_fixed/cnn_fixed]',
             'lot_size': paper_trading_bot.lot_size,
-            'risk_reward_ratio': f'1:{TARGET_PCT/STOP_LOSS_PCT:.2f} (static)',
+            'risk_reward_ratio': f'1:{paper_trading_bot.active_target_pct/paper_trading_bot.active_sl_pct:.2f} (dynamic)',
             'consecutive_losses': paper_trading_bot.consecutive_losses,
             'max_consecutive_losses': paper_trading_bot.max_consecutive_losses,
             'trades_today': int(trades_today),
@@ -1380,15 +1439,22 @@ def serve_trade_logs():
             'cnn_lookback': CNN_LOOKBACK,
             'target_position': target_position,
             'features_used': LSTM_FEATURES,
-            'lstm_model_file': 'lstm_new.h5',
-            'cnn_model_file': 'cnn_new.h5',
+            'lstm_model_file': 'lstm_fixed.h5',
+            'cnn_model_file': 'cnn_fixed.h5',
+            'ce_instrument': INSTRUMENT_TOKEN_CE,
+            'pe_instrument': INSTRUMENT_TOKEN_PE,
             'capital_utilization': f'{CAPITAL_UTILIZATION*100:.0f}%',
             'lstm_mae': lstm_mae,
             'cnn_accuracy': cnn_accuracy,
             'target_sl_config': {
-                'target_pct': TARGET_PCT * 100,
-                'stop_loss_pct': STOP_LOSS_PCT * 100,
-                'type': 'STATIC'
+                'mode': 'DYNAMIC_FROM_LSTM',
+                'target_mult': TARGET_MULT,
+                'sl_mult': SL_MULT,
+                'min_target_pct': MIN_TARGET_PCT * 100,
+                'max_target_pct': MAX_TARGET_PCT * 100,
+                'min_sl_pct': MIN_SL_PCT * 100,
+                'max_sl_pct': MAX_SL_PCT * 100,
+                'mae_gate_price': LSTM_MAE
             },
             'strict_consensus_config': {
                 'strict_consensus': STRICT_CONSENSUS,
@@ -1430,6 +1496,7 @@ def get_status():
             'active_target_pct': paper_trading_bot.active_target_pct * 100,
             'active_sl_pct': paper_trading_bot.active_sl_pct * 100,
             'latest_lstm_predicted_return': latest_lstm_predicted_return * 100,
+            'latest_lstm_close_diff': latest_lstm_close_diff,
             'consecutive_losses': paper_trading_bot.consecutive_losses,
             'trades_today': int(trades_today),
             'lstm_lookback': LSTM_LOOKBACK,
@@ -1471,14 +1538,23 @@ def health_check():
             'lstm': lstm_model is not None,
             'cnn': cnn_model is not None
         },
+        'lstm_model_file': 'lstm_fixed.h5',
+        'cnn_model_file': 'cnn_fixed.h5',
+        'ce_instrument': INSTRUMENT_TOKEN_CE,
+        'pe_instrument': INSTRUMENT_TOKEN_PE,
         'lstm_lookback': LSTM_LOOKBACK,
         'cnn_lookback': CNN_LOOKBACK,
         'lstm_input_shape': str(lstm_model.input_shape) if lstm_model else None,
         'cnn_input_shape': str(cnn_model.input_shape) if cnn_model else None,
         'target_sl_config': {
-            'target_pct': TARGET_PCT * 100,
-            'stop_loss_pct': STOP_LOSS_PCT * 100,
-            'type': 'STATIC'
+            'mode': 'DYNAMIC_FROM_LSTM',
+            'target_mult': TARGET_MULT,
+            'sl_mult': SL_MULT,
+            'min_target_pct': MIN_TARGET_PCT * 100,
+            'max_target_pct': MAX_TARGET_PCT * 100,
+            'min_sl_pct': MIN_SL_PCT * 100,
+            'max_sl_pct': MAX_SL_PCT * 100,
+            'mae_gate_price': LSTM_MAE
         },
         'strict_consensus_config': {
             'strict_consensus': STRICT_CONSENSUS,
@@ -1533,17 +1609,22 @@ paper_trading_bot = PaperTradingBot(balance=INITIAL_BALANCE, lot_size=LOT_SIZE)
 # ============================================================
 if __name__ == '__main__':
     print("="*80)
-    print("ENSEMBLE PAPER TRADING BOT - LSTM+CNN (LOOSE-STRICT CONSENSUS)")
+    print("ENSEMBLE PAPER TRADING BOT - LSTM+CNN (DYNAMIC TARGET/SL)")
+    print("   Models: lstm_fixed.h5 / cnn_fixed.h5")
     print("="*80)
     print("🎯 PAPER TRADING ONLY")
+    print(f"📊 CE Instrument:   {INSTRUMENT_TOKEN_CE}")
+    print(f"📊 PE Instrument:   {INSTRUMENT_TOKEN_PE}")
     print(f"📊 LSTM Lookback:   {LSTM_LOOKBACK}")
     print(f"📊 CNN  Lookback:   {CNN_LOOKBACK}")
     print(f"📊 live_data buffer: {lookback}")
+    print(f"📊 LSTM_MAE (price): {LSTM_MAE}")
     print("="*80)
-    print("⚙️  STATIC TARGET/SL CONFIG:")
-    print(f"   Target: {TARGET_PCT*100:.2f}%")
-    print(f"   SL:     {STOP_LOSS_PCT*100:.2f}%")
-    print(f"   R:R:    1:{TARGET_PCT/STOP_LOSS_PCT:.2f}")
+    print("⚙️  DYNAMIC TARGET/SL CONFIG (derived from LSTM |close_diff|):")
+    print(f"   Gate:  |close_diff| > LSTM_MAE  ({LSTM_MAE})")
+    print(f"   TARGET_MULT: {TARGET_MULT}   SL_MULT: {SL_MULT}")
+    print(f"   Target bounds:  {MIN_TARGET_PCT*100:.2f}%  ..  {MAX_TARGET_PCT*100:.2f}%")
+    print(f"   SL     bounds:  {MIN_SL_PCT*100:.2f}%  ..  {MAX_SL_PCT*100:.2f}%")
     print("="*80)
     print("🔓  LOOSE-STRICT CONSENSUS CONFIG:")
     print(f"   Strict Consensus:        {STRICT_CONSENSUS}")
@@ -1582,8 +1663,10 @@ if __name__ == '__main__':
 
     print(f"✅ Fetched {len(historical_data)} data points")
 
+    live_df = historical_data.iloc[-lookback:].reset_index(drop=True)
     live_data = historical_data['Close'].tolist()[-lookback:]
-    print(f"✅ Initialized live_data with {len(live_data)} points")
+    print(f"✅ Initialized live_df with {len(live_df)} rows "
+          f"(cols={list(live_df.columns)})")
 
     g_current_status = "Bot initialized - Waiting for WebSocket data..."
 
